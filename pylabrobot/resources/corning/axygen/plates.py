@@ -12,7 +12,7 @@ from pylabrobot.resources.well import (
 # # # # # # # # # # Cor_Axy_24_wellplate_10mL_Vb # # # # # # # # # #
 
 
-def Cor_Axy_24_wellplate_10mL_Vb(name: str, with_lid: bool = False) -> Plate:
+def Cor_Axy_24_wellplate_10mL_Vb(name: str, lid: Optional[Lid] = None) -> Plate:
   """
   Corning cat. no.: P-DW-10ML-24-C-S
   - manufacturer_link: https://ecatalog.corning.com/life-sciences/b2b/UK/en/Genomics-&-Molecular-Biology/Automation-Consumables/Deep-Well-Plate/Axygen%C2%AE-Deep-Well-and-Assay-Plates/p/P-DW-10ML-24-C
