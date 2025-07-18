@@ -27,7 +27,7 @@ def Cor_Axy_24_wellplate_10mL_Vb(name: str, with_lid: bool = False) -> Plate:
     size_x=127.76,
     size_y=85.48,
     size_z=44.24,
-    lid=Cor_Axy_24_wellplate_10mL_Vb_Lid(name + "_lid") if with_lid else None,
+    lid=lid,
     model="Axy_24_DW_10ML",
     ordered_items=create_ordered_items_2d(
       Well,
