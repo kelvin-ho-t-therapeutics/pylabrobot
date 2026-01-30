@@ -9,9 +9,9 @@ import webbrowser
 from typing import Any, Dict, List, Optional, Tuple
 
 try:
-  import websockets
-  import websockets.asyncio.server
-  import websockets.exceptions
+  from websockets.server import serve
+  from websockets.exceptions import ConnectionClosed
+
 
   HAS_WEBSOCKETS = True
 except ImportError as e:
@@ -151,7 +151,7 @@ class Visualizer:
     while True:
       try:
         message = await websocket.recv()
-      except websockets.exceptions.ConnectionClosed:
+      except ConnectionClosed:
         return
       except asyncio.CancelledError:
         return
@@ -283,7 +283,7 @@ class Visualizer:
       self._stop_ = self.loop.create_future()
       while True:
         try:
-          async with websockets.asyncio.server.serve(self._socket_handler, self.host, self.ws_port):
+          async with serve(self._socket_handler, self.host, self.ws_port):
             print(f"Websocket server started at http://{self.host}:{self.ws_port}")
             lock.release()
             await self.stop_
