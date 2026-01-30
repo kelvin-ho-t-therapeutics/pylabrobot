@@ -9,8 +9,6 @@ from pylabrobot.liquid_handling.standard import GripDirection, Pickup
 from pylabrobot.plate_reading import PlateReader
 from pylabrobot.plate_reading.chatterbox import PlateReaderChatterboxBackend
 from pylabrobot.resources import (
-  HT,
-  HTF,
   PLT_CAR_L5AC_A00,
   PLT_CAR_L5MD_A00,
   PLT_CAR_P3AC_A01,
@@ -23,16 +21,19 @@ from pylabrobot.resources import (
   Cor_96_wellplate_360ul_Fb,
   Lid,
   ResourceStack,
+  hamilton_96_tiprack_1000uL,
+  hamilton_96_tiprack_1000uL_filter,
   no_volume_tracking,
   set_tip_tracking,
 )
-from pylabrobot.resources.hamilton import STF, STARLetDeck
+from pylabrobot.resources.barcode import Barcode
+from pylabrobot.resources.hamilton import STARLetDeck, hamilton_96_tiprack_300uL_filter
 
 from .STAR_backend import (
-  STAR,
   CommandSyntaxError,
   HamiltonNoTipError,
   HardwareError,
+  STARBackend,
   STARFirmwareError,
   UnknownHamiltonError,
   parse_star_fw_string,
@@ -44,7 +45,7 @@ class TestSTARResponseParsing(unittest.TestCase):
 
   def setUp(self):
     super().setUp()
-    self.star = STAR()
+    self.star = STARBackend()
 
   def test_parse_response_params(self):
     parsed = parse_star_fw_string("C0QMid1111", "")
@@ -144,7 +145,7 @@ class TestSTARUSBComms(unittest.IsolatedAsyncioTestCase):
   """Test that USB data is parsed correctly."""
 
   async def asyncSetUp(self):
-    self.star = STAR(read_timeout=2, packet_read_timeout=1)
+    self.star = STARBackend(read_timeout=1, packet_read_timeout=1)
     self.star.set_deck(STARLetDeck())
     self.star.io = unittest.mock.AsyncMock()
     await super().asyncSetUp()
@@ -165,7 +166,7 @@ class TestSTARUSBComms(unittest.IsolatedAsyncioTestCase):
       await self.star.send_command("C0", command="QM", fmt="id####")
 
 
-class STARCommandCatcher(STAR):
+class STARCommandCatcher(STARBackend):
   """Mock backend for star that catches commands and saves them instead of sending them to the
   machine."""
 
@@ -203,9 +204,9 @@ class TestSTARLiquidHandlerCommands(unittest.IsolatedAsyncioTestCase):
   """Test STAR backend for liquid handling."""
 
   async def asyncSetUp(self):
-    self.STAR = STAR(read_timeout=1)
+    self.STAR = STARBackend(read_timeout=1)
     self.STAR._write_and_read_command = unittest.mock.AsyncMock()
-    self.STAR.io = unittest.mock.MagicMock()
+    self.STAR.io = unittest.mock.AsyncMock()
     self.STAR.io.setup = unittest.mock.AsyncMock()
     self.STAR.io.write = unittest.mock.MagicMock()
     self.STAR.io.read = unittest.mock.MagicMock()
@@ -214,8 +215,8 @@ class TestSTARLiquidHandlerCommands(unittest.IsolatedAsyncioTestCase):
     self.lh = LiquidHandler(self.STAR, deck=self.deck)
 
     self.tip_car = TIP_CAR_480_A00(name="tip carrier")
-    self.tip_car[1] = self.tip_rack = STF(name="tip_rack_01")
-    self.tip_car[2] = self.tip_rack2 = HTF(name="tip_rack_02")
+    self.tip_car[1] = self.tip_rack = hamilton_96_tiprack_300uL_filter(name="tip_rack_01")
+    self.tip_car[2] = self.tip_rack2 = hamilton_96_tiprack_1000uL_filter(name="tip_rack_02")
     self.deck.assign_child_resource(self.tip_car, rails=1)
 
     self.plt_car = PLT_CAR_L5AC_A00(name="plate carrier")
@@ -267,10 +268,118 @@ class TestSTARLiquidHandlerCommands(unittest.IsolatedAsyncioTestCase):
 
     set_tip_tracking(enabled=False)
 
+  async def test_core_read_barcode_success(self):
+    """core_read_barcode_of_picked_up_resource should send ZB and return a Barcode."""
+
+    self.STAR._write_and_read_command.return_value = (  # type: ignore
+      "C0ZBid0001er00/00bb/08ABCDEFGH"
+    )
+
+    barcode = await self.STAR.core_read_barcode_of_picked_up_resource(rails=5)
+
+    # Check command format.
+    self.STAR._write_and_read_command.assert_has_calls(  # type: ignore
+      [
+        _any_write_and_read_command_call(
+          "C0ZBid0001cp05zb2200th2750zy1287bd1ma0250 2100 0860 0200mr0mo000 000 000 000 000 000 000",
+        )
+      ]
+    )
+
+    # Check returned barcode object.
+    self.assertIsInstance(barcode, Barcode)
+    assert barcode is not None
+    self.assertEqual(barcode.data, "ABCDEFGH")
+    self.assertEqual(barcode.symbology, "code128")
+    self.assertEqual(barcode.position_on_resource, "front")
+
+  async def test_core_read_barcode_raises_on_missing_error_section(self):
+    """Unexpected response without error section should raise ValueError."""
+
+    self.STAR._write_and_read_command.return_value = (  # type: ignore
+      "C0ZBid0001bb/08ABCDEFGH"
+    )
+
+    with self.assertRaises(ValueError):
+      await self.STAR.core_read_barcode_of_picked_up_resource(rails=5)
+
+  async def test_core_read_barcode_raises_on_invalid_lengths(self):
+    """Non-integer / inconsistent bb length fields should raise ValueError."""
+
+    # Invalid bb field (non-integer length).
+    self.STAR._write_and_read_command.return_value = (  # type: ignore
+      "C0ZBid0001er00/00bb/XXABCDEFGH"
+    )
+
+    with self.assertRaises(ValueError):
+      await self.STAR.core_read_barcode_of_picked_up_resource(rails=5)
+
+    # Length > 0 but no data present.
+    self.STAR._write_and_read_command.return_value = (  # type: ignore
+      "C0ZBid0001er00/00bb/08"
+    )
+
+    with self.assertRaises(ValueError):
+      await self.STAR.core_read_barcode_of_picked_up_resource(rails=5)
+
+  async def test_core_read_barcode_nonzero_error_code_raises_firmware_error(self):
+    """Non-zero error code should be surfaced as STARFirmwareError."""
+
+    self.STAR._write_and_read_command.return_value = (  # type: ignore
+      "C0ZBid0001er05/30bb/00"
+    )
+
+    with self.assertRaises(STARFirmwareError):
+      await self.STAR.core_read_barcode_of_picked_up_resource(rails=5)
+
+  async def test_core_read_barcode_no_barcode_raises_value_error(self):
+    """bb/00 (no barcode) should raise ValueError so callers can handle it explicitly."""
+
+    self.STAR._write_and_read_command.return_value = (  # type: ignore
+      "C0ZBid0001er00/00bb/00"
+    )
+
+    with self.assertRaises(ValueError):
+      await self.STAR.core_read_barcode_of_picked_up_resource(rails=5)
+
+  async def test_core_read_barcode_manual_input_success(self):
+    """When allow_manual_input=True and bb/00, manual input should be used to build a Barcode."""
+
+    self.STAR._write_and_read_command.return_value = (  # type: ignore
+      "C0ZBid0001er00/00bb/00"
+    )
+
+    with unittest.mock.patch("builtins.input", return_value="MANUAL123"):
+      barcode = await self.STAR.core_read_barcode_of_picked_up_resource(
+        rails=5,
+        allow_manual_input=True,
+        labware_description="Cos_96_PCR_0001",
+      )
+
+    self.assertIsInstance(barcode, Barcode)
+    self.assertEqual(barcode.data, "MANUAL123")
+    self.assertEqual(barcode.symbology, "code128")
+    self.assertEqual(barcode.position_on_resource, "front")
+
+  async def test_core_read_barcode_manual_input_empty_raises_value_error(self):
+    """When allow_manual_input=True and user provides empty input, ValueError should be raised."""
+
+    self.STAR._write_and_read_command.return_value = (  # type: ignore
+      "C0ZBid0001er00/00bb/00"
+    )
+
+    with unittest.mock.patch("builtins.input", return_value="   "):
+      with self.assertRaises(ValueError):
+        await self.STAR.core_read_barcode_of_picked_up_resource(
+          rails=5,
+          allow_manual_input=True,
+          labware_description="Cos_96_PCR_0001",
+        )
+
   async def asyncTearDown(self):
     await self.lh.stop()
 
-  async def test_indictor_light(self):
+  async def test_indicator_light(self):
     await self.STAR.set_loading_indicators(bit_pattern=[True] * 54, blink_pattern=[False] * 54)
     self.STAR._write_and_read_command.assert_has_calls(
       [
@@ -329,10 +438,6 @@ class TestSTARLiquidHandlerCommands(unittest.IsolatedAsyncioTestCase):
       ),
     )
 
-    # make sure two operations on the same spot are not allowed
-    with self.assertRaises(ValueError):
-      self.STAR._ops_to_fw_positions((op1, op1), use_channels=[0, 1])
-
   def test_tip_definition(self):
     pass
 
@@ -384,7 +489,7 @@ class TestSTARLiquidHandlerCommands(unittest.IsolatedAsyncioTestCase):
     assert self.plate.lid is not None
     self.plate.lid.unassign()
     for well in self.plate.get_items(["A1", "B1"]):
-      well.tracker.set_liquids([(None, 100 * 1.072)])  # liquid class correction
+      well.tracker.set_volume(100 * 1.072)  # liquid class correction
     await self.lh.aspirate(self.plate["A1", "B1"], vols=[100, 100], use_channels=[4, 5])
     self.STAR._write_and_read_command.assert_has_calls(
       [
@@ -403,7 +508,7 @@ class TestSTARLiquidHandlerCommands(unittest.IsolatedAsyncioTestCase):
           "mh0000 0000 0000 0000 0000 0000 0000&gi000 000 000 000 000 000 000&gj0gk0lk0 0 0 0 0 0 0&"
           "ik0000 0000 0000 0000 0000 0000 0000&sd0500 0500 0500 0500 0500 0500 0500&se0500 0500 0500 "
           "0500 0500 0500 0500&sz0300 0300 0300 0300 0300 0300 0300&io0000 0000 0000 0000 0000 0000 0"
-          "000&il00000 00000 00000 00000 00000 00000 00000&in0000 0000 0000 0000 0000 0000 0000&",
+          "000&",
         )
       ]
     )
@@ -414,7 +519,7 @@ class TestSTARLiquidHandlerCommands(unittest.IsolatedAsyncioTestCase):
     assert self.plate.lid is not None
     self.plate.lid.unassign()
     well = self.plate.get_item("A1")
-    well.tracker.set_liquids([(None, 100 * 1.072)])  # liquid class correction
+    well.tracker.set_volume(100 * 1.072)  # liquid class correction
     await self.lh.aspirate([well], vols=[100])
     self.STAR._write_and_read_command.assert_has_calls(
       [
@@ -423,8 +528,7 @@ class TestSTARLiquidHandlerCommands(unittest.IsolatedAsyncioTestCase):
           "1866&po0100 0100&zu0032 0032&zr06180 06180&zx1866 1866&ip0000 0000&it0 0&fp0000 0000&"
           "av01072 01072&as1000 1000&ta000 000&ba0000 0000&oa000 000&lm0 0&ll1 1&lv1 1&zo000 000&"
           "ld00 00&de0020 0020&wt10 10&mv00000 00000&mc00 00&mp000 000&ms1000 1000&mh0000 0000&"
-          "gi000 000&gj0gk0lk0 0&ik0000 0000&sd0500 0500&se0500 0500&sz0300 0300&io0000 0000&"
-          "il00000 00000&in0000 0000&",
+          "gi000 000&gj0gk0lk0 0&ik0000 0000&sd0500 0500&se0500 0500&sz0300 0300&io0000 0000&",
         )
       ]
     )
@@ -435,7 +539,7 @@ class TestSTARLiquidHandlerCommands(unittest.IsolatedAsyncioTestCase):
     assert self.plate.lid is not None
     self.plate.lid.unassign()
     well = self.plate.get_item("A1")
-    well.tracker.set_liquids([(None, 100 * 1.072)])  # liquid class correction
+    well.tracker.set_volume(100 * 1.072)  # liquid class correction
     await self.lh.aspirate([well], vols=[100], liquid_height=[10])
 
     # This passes the test, but is not the real command.
@@ -446,8 +550,7 @@ class TestSTARLiquidHandlerCommands(unittest.IsolatedAsyncioTestCase):
           "1966&po0100 0100&zu0032 0032&zr06180 06180&zx1866 1866&ip0000 0000&it0 0&fp0000 0000&"
           "av01072 01072&as1000 1000&ta000 000&ba0000 0000&oa000 000&lm0 0&ll1 1&lv1 1&zo000 000&"
           "ld00 00&de0020 0020&wt10 10&mv00000 00000&mc00 00&mp000 000&ms1000 1000&mh0000 0000&"
-          "gi000 000&gj0gk0lk0 0&ik0000 0000&sd0500 0500&se0500 0500&sz0300 0300&io0000 0000&"
-          "il00000 00000&in0000 0000&",
+          "gi000 000&gj0gk0lk0 0&ik0000 0000&sd0500 0500&se0500 0500&sz0300 0300&io0000 0000&",
         )
       ]
     )
@@ -459,7 +562,7 @@ class TestSTARLiquidHandlerCommands(unittest.IsolatedAsyncioTestCase):
     self.plate.lid.unassign()
     wells = self.plate.get_items("A1:B1")
     for well in wells:
-      well.tracker.set_liquids([(None, 100 * 1.072)])  # liquid class correction
+      well.tracker.set_volume(100 * 1.072)  # liquid class correction
     await self.lh.aspirate(self.plate["A1:B1"], vols=[100] * 2)
 
     # This passes the test, but is not the real command.
@@ -472,8 +575,7 @@ class TestSTARLiquidHandlerCommands(unittest.IsolatedAsyncioTestCase):
           "1000&ta000 000 000&ba0000 0000 0000&oa000 000 000&lm0 0 0&ll1 1 1&lv1 1 1&zo000 000 000&"
           "ld00 00 00&de0020 0020 0020&wt10 10 10&mv00000 00000 00000&mc00 00 00&mp000 000 000&"
           "ms1000 1000 1000&mh0000 0000 0000&gi000 000 000&gj0gk0lk0 0 0&ik0000 0000 0000&sd0500 0500 "
-          "0500&se0500 0500 0500&sz0300 0300 0300&io0000 0000 0000&il00000 00000 00000&in0000 0000 "
-          "0000&",
+          "0500&se0500 0500 0500&sz0300 0300 0300&io0000 0000 0000&",
         )
       ]
     )
@@ -501,8 +603,7 @@ class TestSTARLiquidHandlerCommands(unittest.IsolatedAsyncioTestCase):
           "00000 00000 00000 00000 00000&mc00 00 00 00 00 00&mp000 000 000 000 000 000&ms1000 1000 "
           "1000 1000 1000 1000&mh0000 0000 0000 0000 0000 0000&gi000 000 000 000 000 000&gj0gk0lk0 0 0 "
           "0 0 0&ik0000 0000 0000 0000 0000 0000&sd0500 0500 0500 0500 0500 0500&se0500 0500 0500 0500 "
-          "0500 0500&sz0300 0300 0300 0300 0300 0300&io0000 0000 0000 0000 0000 0000&il00000 00000 "
-          "00000 00000 00000 00000&in0000 0000 0000 0000 0000 0000&",
+          "0500 0500&sz0300 0300 0300 0300 0300 0300&io0000 0000 0000 0000 0000 0000&",
         )
       ]
     )
@@ -580,9 +681,15 @@ class TestSTARLiquidHandlerCommands(unittest.IsolatedAsyncioTestCase):
     self.STAR._write_and_read_command.assert_has_calls(
       [
         _any_write_and_read_command_call("C0TTid0001tt01tf1tl0519tv03600tg2tu0"),
-        _any_write_and_read_command_call("C0EPid0002xs01179xd0yh2418tt01wu0za2164zh2450ze2450"),
+        _any_write_and_read_command_call("H0DQid0002dq11281dv13500du00000dr900000dw15"),
+        _any_write_and_read_command_call("C0EPid0003xs01179xd0yh2418tt01wu0za2164zh2450ze2450"),
       ]
     )
+
+  async def test_tip_tracking_pick_up96(self):
+    set_tip_tracking(enabled=True)
+    await self.lh.pick_up_tips96(self.tip_rack)
+    set_tip_tracking(enabled=False)
 
   async def test_core_96_tip_drop(self):
     await self.lh.pick_up_tips96(self.tip_rack)  # pick up tips first
@@ -590,7 +697,7 @@ class TestSTARLiquidHandlerCommands(unittest.IsolatedAsyncioTestCase):
     await self.lh.drop_tips96(self.tip_rack)
     self.STAR._write_and_read_command.assert_has_calls(
       [
-        _any_write_and_read_command_call("C0ERid0003xs01179xd0yh2418za2164zh2450ze2450"),
+        _any_write_and_read_command_call("C0ERid0004xs01179xd0yh2418za2164zh2450ze2450"),
       ]
     )
 
@@ -600,7 +707,7 @@ class TestSTARLiquidHandlerCommands(unittest.IsolatedAsyncioTestCase):
     await self.lh.discard_tips96()
     self.STAR._write_and_read_command.assert_has_calls(
       [
-        _any_write_and_read_command_call("C0ERid0003xs00420xd1yh1203za2164zh2450ze2450"),
+        _any_write_and_read_command_call("C0ERid0004xs00420xd1yh1203za2164zh2450ze2450"),
       ]
     )
 
@@ -617,7 +724,7 @@ class TestSTARLiquidHandlerCommands(unittest.IsolatedAsyncioTestCase):
     self.STAR._write_and_read_command.assert_has_calls(
       [
         _any_write_and_read_command_call(
-          "C0EAid0003aa0xs02983xd0yh1457zh2450ze2450lz1999zt1866pp0100zm1866zv0032zq06180iw000ix0fh000af01083ag2500vt050bv00000wv00050cm0cs1bs0020wh10hv00000hc00hp000mj000hs1200cwFFFFFFFFFFFFFFFFFFFFFFFFcr000cj0cx0"
+          "C0EAid0004aa0xs02983xd0yh1457zh2450ze2450lz1999zt1866pp0100zm1866zv0032zq06180iw000ix0fh000af01083ag2500vt050bv00000wv00050cm0cs1bs0020wh10hv00000hc00hp000mj000hs1200cwFFFFFFFFFFFFFFFFFFFFFFFFcr000cj0cx0"
         ),
       ]
     )
@@ -636,7 +743,7 @@ class TestSTARLiquidHandlerCommands(unittest.IsolatedAsyncioTestCase):
     self.STAR._write_and_read_command.assert_has_calls(
       [
         _any_write_and_read_command_call(
-          "C0EDid0004da3xs02983xd0yh1457zm1866zv0032zq06180lz1999zt1866pp0100iw000ix0fh000zh2450ze2450df01083dg1200es0050ev000vt050bv00000cm0cs1ej00bs0020wh00hv00000hc00hp000mj000hs1200cwFFFFFFFFFFFFFFFFFFFFFFFFcr000cj0cx0"
+          "C0EDid0005da3xs02983xd0yh1457zm1866zv0032zq06180lz1999zt1866pp0100iw000ix0fh000zh2450ze2450df01083dg1200es0050ev000vt050bv00000cm0cs1ej00bs0020wh00hv00000hc00hp000mj000hs1200cwFFFFFFFFFFFFFFFFFFFFFFFFcr000cj0cx0"
         ),
       ]
     )
@@ -658,7 +765,7 @@ class TestSTARLiquidHandlerCommands(unittest.IsolatedAsyncioTestCase):
     self.STAR._write_and_read_command.assert_has_calls(
       [
         _any_write_and_read_command_call(
-          "C0PPid0001xs03479xd0yj1142yd0zj1874zd0gr1th2800te2800gw4go1308gb1245gt20ga0gc1",
+          "C0PPid0001xs03479xd0yj1142yd0zj1874zd0gr1th2800te2800gw4go1308gb1245gt20ga0gc0",
         ),
         _any_write_and_read_command_call(
           "C0PRid0002xs03479xd0yj3062yd0zj1874zd0th2800te2800gr1go1308ga0gc0",
@@ -688,7 +795,7 @@ class TestSTARLiquidHandlerCommands(unittest.IsolatedAsyncioTestCase):
     self.STAR._write_and_read_command.assert_has_calls(
       [
         _any_write_and_read_command_call(
-          "C0PPid0001xs03479xd0yj1142yd0zj1924zd0gr1th2800te2800gw4go1308gb1245gt20ga0gc1",
+          "C0PPid0001xs03479xd0yj1142yd0zj1924zd0gr1th2800te2800gw4go1308gb1245gt20ga0gc0",
         ),
         _any_write_and_read_command_call(
           "C0PRid0002xs10427xd0yj3286yd0zj2063zd0th2800te2800gr4go1308ga0gc0",
@@ -711,7 +818,7 @@ class TestSTARLiquidHandlerCommands(unittest.IsolatedAsyncioTestCase):
     self.STAR._write_and_read_command.assert_has_calls(
       [
         _any_write_and_read_command_call(
-          "C0PPid0003xs10427xd0yj3286yd0zj2063zd0gr4th2800te2800gw4go1308gb1245gt20ga0gc1",
+          "C0PPid0003xs10427xd0yj3286yd0zj2063zd0gr4th2800te2800gw4go1308gb1245gt20ga0gc0",
         ),
         _any_write_and_read_command_call(
           "C0PRid0004xs03479xd0yj1142yd0zj1924zd0th2800te2800gr1go1308ga0gc0",
@@ -727,7 +834,7 @@ class TestSTARLiquidHandlerCommands(unittest.IsolatedAsyncioTestCase):
     self.STAR._write_and_read_command.assert_has_calls(
       [
         _any_write_and_read_command_call(
-          "C0PPid0001xs03479xd0yj1142yd0zj1950zd0gr1th2800te2800gw4go1308gb1245gt20ga0gc1"
+          "C0PPid0001xs03479xd0yj1142yd0zj1950zd0gr1th2800te2800gw4go1308gb1245gt20ga0gc0"
         ),
         _any_write_and_read_command_call(
           "C0PRid0002xs03479xd0yj2102yd0zj1950zd0th2800te2800gr1go1308ga0gc0"
@@ -747,7 +854,7 @@ class TestSTARLiquidHandlerCommands(unittest.IsolatedAsyncioTestCase):
     self.STAR._write_and_read_command.assert_has_calls(
       [
         _any_write_and_read_command_call(
-          "C0PPid0001xs03479xd0yj1142yd0zj1950zd0gr1th2800te2800gw4go1308gb1245gt20ga0gc1"
+          "C0PPid0001xs03479xd0yj1142yd0zj1950zd0gr1th2800te2800gw4go1308gb1245gt20ga0gc0"
         ),
         _any_write_and_read_command_call(
           "C0PRid0002xs00699xd0yj4567yd0zj2305zd0th2800te2800gr1go1308ga0gc0"
@@ -761,7 +868,7 @@ class TestSTARLiquidHandlerCommands(unittest.IsolatedAsyncioTestCase):
     self.STAR._write_and_read_command.assert_has_calls(
       [
         _any_write_and_read_command_call(
-          "C0PPid0003xs00699xd0yj4567yd0zj2305zd0gr1th2800te2800gw4go1308gb1245gt20ga0gc1"
+          "C0PPid0003xs00699xd0yj4567yd0zj2305zd0gr1th2800te2800gw4go1308gb1245gt20ga0gc0"
         ),
         _any_write_and_read_command_call(
           "C0PRid0004xs03479xd0yj1142yd0zj1950zd0th2800te2800gr1go1308ga0gc0"
@@ -781,7 +888,7 @@ class TestSTARLiquidHandlerCommands(unittest.IsolatedAsyncioTestCase):
     self.STAR._write_and_read_command.assert_has_calls(
       [
         _any_write_and_read_command_call(
-          "C0PPid0001xs03479xd0yj1142yd0zj1950zd0gr1th2800te2800gw4go1308gb1245gt20ga0gc1"
+          "C0PPid0001xs03479xd0yj1142yd0zj1950zd0gr1th2800te2800gw4go1308gb1245gt20ga0gc0"
         ),
         _any_write_and_read_command_call(
           "C0PRid0002xs00699xd0yj4567yd0zj2305zd0th2800te2800gr1go1308ga0gc0"
@@ -794,7 +901,7 @@ class TestSTARLiquidHandlerCommands(unittest.IsolatedAsyncioTestCase):
     self.STAR._write_and_read_command.assert_has_calls(
       [
         _any_write_and_read_command_call(
-          "C0PPid0003xs03479xd0yj2102yd0zj1950zd0gr1th2800te2800gw4go1308gb1245gt20ga0gc1"
+          "C0PPid0003xs03479xd0yj2102yd0zj1950zd0gr1th2800te2800gw4go1308gb1245gt20ga0gc0"
         ),
         _any_write_and_read_command_call(
           "C0PRid0004xs00699xd0yj4567yd0zj2405zd0th2800te2800gr1go1308ga0gc0"
@@ -810,7 +917,7 @@ class TestSTARLiquidHandlerCommands(unittest.IsolatedAsyncioTestCase):
     self.STAR._write_and_read_command.assert_has_calls(
       [
         _any_write_and_read_command_call(
-          "C0PPid0005xs00699xd0yj4567yd0zj2405zd0gr1th2800te2800gw4go1308gb1245gt20ga0gc1"
+          "C0PPid0005xs00699xd0yj4567yd0zj2405zd0gr1th2800te2800gw4go1308gb1245gt20ga0gc0"
         ),
         _any_write_and_read_command_call(
           "C0PRid0006xs03479xd0yj1142yd0zj1950zd0th2800te2800gr1go1308ga0gc0"
@@ -825,7 +932,7 @@ class TestSTARLiquidHandlerCommands(unittest.IsolatedAsyncioTestCase):
     self.STAR._write_and_read_command.assert_has_calls(
       [
         _any_write_and_read_command_call(
-          "C0PPid0007xs00699xd0yj4567yd0zj2305zd0gr1th2800te2800gw4go1308gb1245gt20ga0gc1"
+          "C0PPid0007xs00699xd0yj4567yd0zj2305zd0gr1th2800te2800gw4go1308gb1245gt20ga0gc0"
         ),
         _any_write_and_read_command_call(
           "C0PRid0008xs03479xd0yj2102yd0zj1950zd0th2800te2800gr1go1308ga0gc0"
@@ -848,7 +955,7 @@ class TestSTARLiquidHandlerCommands(unittest.IsolatedAsyncioTestCase):
     self.STAR._write_and_read_command.assert_has_calls(
       [
         _any_write_and_read_command_call(
-          "C0PPid0001xs03479xd0yj1142yd0zj1874zd0gr1th2800te2800gw4go1308gb1245gt20ga0gc1"
+          "C0PPid0001xs03479xd0yj1142yd0zj1874zd0gr1th2800te2800gw4go1308gb1245gt20ga0gc0"
         ),
         _any_write_and_read_command_call("C0PMid0002xs03979xd0yj3062yd0zj2405zd0gr1th2800ga1xe4 1"),
         _any_write_and_read_command_call("C0PMid0003xs02979xd0yj4022yd0zj2405zd0gr1th2800ga1xe4 1"),
@@ -878,7 +985,7 @@ class TestSTARLiquidHandlerCommands(unittest.IsolatedAsyncioTestCase):
     deck = STARLetDeck()
     lh = LiquidHandler(self.STAR, deck=deck)
     tip_car = TIP_CAR_288_C00(name="tip carrier")
-    tip_car[0] = tr = HT(name="tips_01").rotated(z=90)
+    tip_car[0] = tr = hamilton_96_tiprack_1000uL(name="tips_01").rotated(z=90)
     assert tr.rotation.z == 90
     assert tr.location == Coordinate(82.6, 0, 0)
     deck.assign_child_resource(tip_car, rails=2)
@@ -902,10 +1009,10 @@ class TestSTARLiquidHandlerCommands(unittest.IsolatedAsyncioTestCase):
     )
 
   def test_serialize(self):
-    serialized = LiquidHandler(backend=STAR(), deck=STARLetDeck()).serialize()
+    serialized = LiquidHandler(backend=STARBackend(), deck=STARLetDeck()).serialize()
     deserialized = LiquidHandler.deserialize(serialized)
     self.assertEqual(deserialized.__class__.__name__, "LiquidHandler")
-    self.assertEqual(deserialized.backend.__class__.__name__, "STAR")
+    self.assertEqual(deserialized.backend.__class__.__name__, "STARBackend")
 
   async def test_move_core(self):
     self.plt_car[1].resource.unassign()
@@ -915,14 +1022,13 @@ class TestSTARLiquidHandlerCommands(unittest.IsolatedAsyncioTestCase):
       pickup_distance_from_top=13 - 3.33,
       use_arm="core",
       # kwargs specific to pickup and drop
-      channel_1=7,
-      channel_2=8,
+      core_front_channel=7,
       return_core_gripper=True,
     )
     self.STAR._write_and_read_command.assert_has_calls(
       [
         _any_write_and_read_command_call(
-          "C0ZTid0001xs07975xd0ya1240yb1065pa07pb08tp2350tz2250th2800tt14"
+          "C0ZTid0001xs07975xd0ya1250yb1070pa07pb08tp2350tz2250th2800tt14"
         ),
         _any_write_and_read_command_call(
           "C0ZPid0002xs03479xd0yj1142yv0050zj1876zy0500yo0885yg0825yw15" "th2800te2800"
@@ -931,7 +1037,7 @@ class TestSTARLiquidHandlerCommands(unittest.IsolatedAsyncioTestCase):
           "C0ZRid0003xs03479xd0yj2102zj1876zi000zy0500yo0885th2800te2800"
         ),
         _any_write_and_read_command_call(
-          "C0ZSid0004xs07975xd0ya1240yb1065tp2150tz2050th2800te2800"
+          "C0ZSid0004xs07975xd0ya1250yb1070tp2150tz2050th2800te2800"
         ),
       ]
     )
@@ -939,7 +1045,7 @@ class TestSTARLiquidHandlerCommands(unittest.IsolatedAsyncioTestCase):
 
 class STARIswapMovementTests(unittest.IsolatedAsyncioTestCase):
   async def asyncSetUp(self):
-    self.STAR = STAR()
+    self.STAR = STARBackend()
     self.STAR._write_and_read_command = unittest.mock.AsyncMock()
     self.deck = STARLetDeck()
     self.lh = LiquidHandler(self.STAR, deck=self.deck)
@@ -966,13 +1072,13 @@ class STARIswapMovementTests(unittest.IsolatedAsyncioTestCase):
     self.STAR._write_and_read_command.assert_has_calls(
       [
         _any_write_and_read_command_call(
-          "C0PPid0001xs04829xd0yj1141yd0zj2143zd0gr1th2800te2800gw4go1308gb1245gt20ga0gc1",
+          "C0PPid0001xs04829xd0yj1141yd0zj2143zd0gr1th2800te2800gw4go1308gb1245gt20ga0gc0",
         ),
         _any_write_and_read_command_call(
           "C0PRid0002xs04829xd0yj2101yd0zj2143zd0th2800te2800gr1go1308ga0gc0",
         ),
         _any_write_and_read_command_call(
-          "C0PPid0003xs04829xd0yj2101yd0zj2143zd0gr1th2800te2800gw4go1308gb1245gt20ga0gc1",
+          "C0PPid0003xs04829xd0yj2101yd0zj2143zd0gr1th2800te2800gw4go1308gb1245gt20ga0gc0",
         ),
         _any_write_and_read_command_call(
           "C0PRid0004xs04829xd0yj1141yd0zj2143zd0th2800te2800gr1go1308ga0gc0"
@@ -987,13 +1093,13 @@ class STARIswapMovementTests(unittest.IsolatedAsyncioTestCase):
     self.STAR._write_and_read_command.assert_has_calls(
       [
         _any_write_and_read_command_call(
-          "C0PPid0001xs04829xd0yj1141yd0zj2143zd0gr1th2800te2800gw4go1308gb1245gt20ga0gc1",
+          "C0PPid0001xs04829xd0yj1141yd0zj2143zd0gr1th2800te2800gw4go1308gb1245gt20ga0gc0",
         ),
         _any_write_and_read_command_call(
           "C0PRid0002xs02317xd0yj1644yd0zj1884zd0th2800te2800gr4go1308ga0gc0",
         ),
         _any_write_and_read_command_call(
-          "C0PPid0003xs02317xd0yj1644yd0zj1884zd0gr1th2800te2800gw4go0881gb0818gt20ga0gc1",
+          "C0PPid0003xs02317xd0yj1644yd0zj1884zd0gr1th2800te2800gw4go0881gb0818gt20ga0gc0",
         ),
         _any_write_and_read_command_call(
           "C0PRid0004xs04829xd0yj1141yd0zj2143zd0th2800te2800gr4go0881ga0gc0",
@@ -1008,13 +1114,13 @@ class STARIswapMovementTests(unittest.IsolatedAsyncioTestCase):
     self.STAR._write_and_read_command.assert_has_calls(
       [
         _any_write_and_read_command_call(
-          "C0PPid0001xs04829xd0yj1141yd0zj2143zd0gr1th2800te2800gw4go1308gb1245gt20ga0gc1",
+          "C0PPid0001xs04829xd0yj1141yd0zj2143zd0gr1th2800te2800gw4go1308gb1245gt20ga0gc0",
         ),
         _any_write_and_read_command_call(
           "C0PRid0002xs02317xd0yj1644yd0zj1884zd0th2800te2800gr2go1308ga0gc0",
         ),
         _any_write_and_read_command_call(
-          "C0PPid0003xs02317xd0yj1644yd0zj1884zd0gr1th2800te2800gw4go0881gb0818gt20ga0gc1",
+          "C0PPid0003xs02317xd0yj1644yd0zj1884zd0gr1th2800te2800gw4go0881gb0818gt20ga0gc0",
         ),
         _any_write_and_read_command_call(
           "C0PRid0004xs04829xd0yj1141yd0zj2143zd0th2800te2800gr2go0881ga0gc0",
@@ -1043,19 +1149,19 @@ class STARIswapMovementTests(unittest.IsolatedAsyncioTestCase):
     self.STAR._write_and_read_command.assert_has_calls(
       [
         _any_write_and_read_command_call(
-          "C0PPid0001xs04829xd0yj1142yd0zj2242zd0gr1th2800te2800gw4go1308gb1245gt20ga0gc1",
+          "C0PPid0001xs04829xd0yj1142yd0zj2242zd0gr1th2800te2800gw4go1308gb1245gt20ga0gc0",
         ),
         _any_write_and_read_command_call(
           "C0PRid0002xs02318xd0yj1644yd0zj1983zd0th2800te2800gr4go1308ga0gc0",
         ),
         _any_write_and_read_command_call(
-          "C0PPid0003xs02318xd0yj1644yd0zj1983zd0gr1th2800te2800gw4go0885gb0822gt20ga0gc1",
+          "C0PPid0003xs02318xd0yj1644yd0zj1983zd0gr1th2800te2800gw4go0885gb0822gt20ga0gc0",
         ),
         _any_write_and_read_command_call(
           "C0PRid0004xs02315xd0yj3104yd0zj1983zd0th2800te2800gr3go0885ga0gc0",
         ),
         _any_write_and_read_command_call(
-          "C0PPid0005xs02315xd0yj3104yd0zj1983zd0gr1th2800te2800gw4go0885gb0822gt20ga0gc1",
+          "C0PPid0005xs02315xd0yj3104yd0zj1983zd0gr1th2800te2800gw4go0885gb0822gt20ga0gc0",
         ),
         _any_write_and_read_command_call(
           "C0PRid0006xs04829xd0yj1142yd0zj2242zd0th2800te2800gr4go0885ga0gc0",
@@ -1066,13 +1172,13 @@ class STARIswapMovementTests(unittest.IsolatedAsyncioTestCase):
 
 class STARFoilTests(unittest.IsolatedAsyncioTestCase):
   async def asyncSetUp(self):
-    self.star = STAR()
+    self.star = STARBackend()
     self.star._write_and_read_command = unittest.mock.AsyncMock()
     self.deck = STARLetDeck()
     self.lh = LiquidHandler(backend=self.star, deck=self.deck)
 
     tip_carrier = TIP_CAR_480_A00(name="tip_carrier")
-    tip_carrier[1] = self.tip_rack = HT(name="tip_rack")
+    tip_carrier[1] = self.tip_rack = hamilton_96_tiprack_1000uL(name="tip_rack")
     self.deck.assign_child_resource(tip_carrier, rails=1)
 
     plt_carrier = PLT_CAR_L5AC_A00(name="plt_carrier")
@@ -1267,3 +1373,124 @@ class STARFoilTests(unittest.IsolatedAsyncioTestCase):
         _any_write_and_read_command_call("C0ZAid0015"),
       ]
     )
+
+
+class TestSTARTipPickupDropAllSizes(unittest.IsolatedAsyncioTestCase):
+  """Test STAR tip pickup and drop Z position calculations for all tip sizes."""
+
+  async def asyncSetUp(self):
+    self.backend = STARBackend()
+    self.backend._write_and_read_command = unittest.mock.AsyncMock()
+    self.backend.io = unittest.mock.AsyncMock()
+    self.backend._num_channels = 8
+    self.backend.core96_head_installed = True
+    self.backend.iswap_installed = True
+    self.backend.setup = unittest.mock.AsyncMock()
+    self.backend._core_parked = True
+    self.backend._iswap_parked = True
+
+    self.deck = STARLetDeck()
+    self.lh = LiquidHandler(self.backend, deck=self.deck)
+
+    self.tip_car = TIP_CAR_480_A00(name="tip_carrier")
+    self.deck.assign_child_resource(self.tip_car, rails=1)
+
+    await self.lh.setup()
+    set_tip_tracking(enabled=False)
+
+  def _get_tp_tz_from_calls(self, cmd_prefix: str):
+    """Extract tp and tz values from mock calls matching the command prefix."""
+    for call in self.backend._write_and_read_command.call_args_list:
+      cmd = call.kwargs.get("cmd", "")
+      if cmd.startswith(cmd_prefix):
+        parsed = parse_star_fw_string(cmd, "tp####tz####")
+        return parsed.get("tp"), parsed.get("tz")
+    return None, None
+
+  async def test_10uL_tips(self):
+    from pylabrobot.resources.hamilton.tip_racks import hamilton_96_tiprack_10uL
+
+    tip_rack = hamilton_96_tiprack_10uL("tips")
+    self.tip_car[1] = tip_rack
+
+    await self.lh.pick_up_tips(tip_rack["A1"])
+    tp, tz = self._get_tp_tz_from_calls("C0TP")
+    self.assertEqual(tp, 2224)
+    self.assertEqual(tz, 2164)
+
+    self.backend._write_and_read_command.reset_mock()
+    self.backend._write_and_read_command.return_value = (
+      "C0TRid0001kz000 000 000 000 000 000 000 000vz000 000 000 000 000 000 000 000"
+    )
+    await self.lh.drop_tips(tip_rack["A1"])
+    tp, tz = self._get_tp_tz_from_calls("C0TR")
+    self.assertEqual(tp, 2224)
+    self.assertEqual(tz, 2144)
+
+    tip_rack.unassign()
+
+  async def test_50uL_tips(self):
+    from pylabrobot.resources.hamilton.tip_racks import hamilton_96_tiprack_50uL
+
+    tip_rack = hamilton_96_tiprack_50uL("tips")
+    self.tip_car[1] = tip_rack
+
+    await self.lh.pick_up_tips(tip_rack["A1"])
+    tp, tz = self._get_tp_tz_from_calls("C0TP")
+    self.assertEqual(tp, 2248)
+    self.assertEqual(tz, 2168)
+
+    self.backend._write_and_read_command.reset_mock()
+    self.backend._write_and_read_command.return_value = (
+      "C0TRid0001kz000 000 000 000 000 000 000 000vz000 000 000 000 000 000 000 000"
+    )
+    await self.lh.drop_tips(tip_rack["A1"])
+    tp, tz = self._get_tp_tz_from_calls("C0TR")
+    self.assertEqual(tp, 2248)
+    self.assertEqual(tz, 2168)
+
+    tip_rack.unassign()
+
+  async def test_300uL_tips(self):
+    from pylabrobot.resources.hamilton.tip_racks import hamilton_96_tiprack_300uL
+
+    tip_rack = hamilton_96_tiprack_300uL("tips")
+    self.tip_car[1] = tip_rack
+
+    await self.lh.pick_up_tips(tip_rack["A1"])
+    tp, tz = self._get_tp_tz_from_calls("C0TP")
+    self.assertEqual(tp, 2244)
+    self.assertEqual(tz, 2164)
+
+    self.backend._write_and_read_command.reset_mock()
+    self.backend._write_and_read_command.return_value = (
+      "C0TRid0001kz000 000 000 000 000 000 000 000vz000 000 000 000 000 000 000 000"
+    )
+    await self.lh.drop_tips(tip_rack["A1"])
+    tp, tz = self._get_tp_tz_from_calls("C0TR")
+    self.assertEqual(tp, 2244)
+    self.assertEqual(tz, 2164)
+
+    tip_rack.unassign()
+
+  async def test_1000uL_tips(self):
+    from pylabrobot.resources.hamilton.tip_racks import hamilton_96_tiprack_1000uL
+
+    tip_rack = hamilton_96_tiprack_1000uL("tips")
+    self.tip_car[1] = tip_rack
+
+    await self.lh.pick_up_tips(tip_rack["A1"])
+    tp, tz = self._get_tp_tz_from_calls("C0TP")
+    self.assertEqual(tp, 2266)
+    self.assertEqual(tz, 2166)
+
+    self.backend._write_and_read_command.reset_mock()
+    self.backend._write_and_read_command.return_value = (
+      "C0TRid0001kz000 000 000 000 000 000 000 000vz000 000 000 000 000 000 000 000"
+    )
+    await self.lh.drop_tips(tip_rack["A1"])
+    tp, tz = self._get_tp_tz_from_calls("C0TR")
+    self.assertEqual(tp, 2266)
+    self.assertEqual(tz, 2186)
+
+    tip_rack.unassign()

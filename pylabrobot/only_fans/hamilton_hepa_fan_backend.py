@@ -8,11 +8,8 @@ from .backend import FanBackend
 class HamiltonHepaFanBackend(FanBackend):
   """Backend for Hepa fan attachment on Hamilton Liquid Handler"""
 
-  def __init__(self, vid=0x0856, pid=0xAC11, serial_number=None, device_id=None):
-    self.vid = vid
-    self.pid = pid
-    self.serial_number = serial_number
-    self.io = FTDI(device_id=device_id)
+  def __init__(self, device_id=None):
+    self.io = FTDI(device_id=device_id, vid=0x0856, pid=0xAC11)
 
   async def setup(self):
     await self.io.setup()
@@ -135,7 +132,7 @@ class HamiltonHepaFanBackend(FanBackend):
       "55c10111f78c",
       "55c10111f982",
       "55c10111fc87",
-      "5c10111fe85",
+      "55c10111fe85",
     ]
 
     await self.send(bytes.fromhex(speed_array[intensity]))  # set speed

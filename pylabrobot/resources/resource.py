@@ -4,7 +4,7 @@ import itertools
 import json
 import logging
 import sys
-from typing import Any, Callable, Dict, List, Optional, cast
+from typing import Any, Callable, Dict, List, Optional, Union, cast
 
 from pylabrobot.serializer import deserialize, serialize
 from pylabrobot.utils.linalg import matrix_vector_multiply_3x3
@@ -21,6 +21,39 @@ else:
   from typing_extensions import Self
 
 logger = logging.getLogger("pylabrobot")
+
+
+def _compute_location_from_anchors(
+  parent: "Resource",
+  child: "Resource",
+  parent_anchor: Union[tuple[str, str, str], str],
+  child_anchor: Union[tuple[str, str, str], str],
+) -> Coordinate:
+  """Compute the location for a child resource to align anchor points.
+
+  Args:
+    parent: The parent resource.
+    child: The child resource to be assigned.
+    parent_anchor: Tuple of (x, y, z) anchor specifiers or a 3-character string for the parent.
+    child_anchor: Tuple of (x, y, z) anchor specifiers or a 3-character string for the child.
+
+  Returns:
+    The location to pass to assign_child_resource to align the anchors.
+  """
+  # Convert string anchors to tuples
+  if isinstance(parent_anchor, str):
+    if len(parent_anchor) != 3:
+      raise ValueError(f"Anchor string must be exactly 3 characters, got: {parent_anchor}")
+    parent_anchor = (parent_anchor[0], parent_anchor[1], parent_anchor[2])
+
+  if isinstance(child_anchor, str):
+    if len(child_anchor) != 3:
+      raise ValueError(f"Anchor string must be exactly 3 characters, got: {child_anchor}")
+    child_anchor = (child_anchor[0], child_anchor[1], child_anchor[2])
+
+  parent_anchor_pos = parent.get_anchor(x=parent_anchor[0], y=parent_anchor[1], z=parent_anchor[2])
+  child_anchor_pos = child.get_anchor(x=child_anchor[0], y=child_anchor[1], z=child_anchor[2])
+  return parent_anchor_pos - child_anchor_pos
 
 
 WillAssignResourceCallback = Callable[["Resource"], None]
@@ -133,7 +166,7 @@ class Resource:
 
   def __repr__(self) -> str:
     return (
-      f"{self.__class__.__name__}(name={self.name}, location={self.location}, "
+      f"{self.__class__.__name__}(name={self.name!r}, location={self.location}, "
       f"size_x={self._size_x}, size_y={self._size_y}, size_z={self._size_z}, "
       f"category={self.category})"
     )
@@ -226,7 +259,7 @@ class Resource:
       )
     )
 
-    if self.parent is None:
+    if self.parent is None or self.parent.location is None:
       return self.location + rotated_anchor
 
     parent_pos = self.parent.get_absolute_location()
@@ -237,6 +270,31 @@ class Resource:
       )
     )
     return parent_pos + rotated_location + rotated_anchor
+
+  def get_location_wrt(
+    self, other: Resource, x: str = "l", y: str = "f", z: str = "b"
+  ) -> Coordinate:
+    """Get the location of this resource with respect to another resource.
+
+    Args:
+      other: The resource to get the location with respect to.
+      x: `"l"`/`"left"`, `"c"`/`"center"`, or `"r"`/`"right"`
+      y: `"b"`/`"back"`, `"c"`/`"center"`, or `"f"`/`"front"`
+      z: `"t"`/`"top"`, `"c"`/`"center"`, or `"b"`/`"bottom"`
+    """
+
+    if not self.is_in_subtree_of(other):
+      raise ValueError(
+        f"Resources '{self.name}' is not in the subtree of '{other.name}'. "
+        "This operation is not currently supported."
+      )
+
+    other_absolute_lfb = (
+      other.get_absolute_location(x="l", y="f", z="b")
+      if other.location is not None
+      else Coordinate(0, 0, 0)
+    )
+    return self.get_absolute_location(x=x, y=y, z=z) - other_absolute_lfb
 
   def _get_rotated_corners(self) -> List[Coordinate]:
     absolute_rotation = self.get_absolute_rotation()
@@ -317,6 +375,59 @@ class Resource:
     for callback in self._did_assign_resource_callbacks:
       callback(resource)
 
+  def assign_child_by_anchor(
+    self,
+    resource: Resource,
+    parent_anchor: Union[tuple[str, str, str], str] = ("l", "f", "b"),
+    child_anchor: Union[tuple[str, str, str], str] = ("l", "f", "b"),
+    reassign: bool = True,
+  ):
+    """Assign a child resource by aligning anchor points.
+
+    This method computes the location needed to align the specified anchor points of the parent
+    and child resources, then calls :meth:`assign_child_resource` with the computed location.
+
+    Args:
+      resource: The resource to assign.
+      parent_anchor: Anchor specifiers for the parent. Can be either:
+        - A tuple of (x, y, z) strings, or
+        - A 3-character string (e.g., "lfb" for left-front-bottom)
+        Each element can be:
+        x: `"l"`/`"left"`, `"c"`/`"center"`, or `"r"`/`"right"`
+        y: `"b"`/`"back"`, `"c"`/`"center"`, or `"f"`/`"front"`
+        z: `"t"`/`"top"`, `"c"`/`"center"`, or `"b"`/`"bottom"`
+        Defaults to left-front-bottom.
+      child_anchor: Anchor specifiers for the child (same format as parent_anchor).
+        Defaults to left-front-bottom.
+      reassign: If `False`, an error will be raised if the resource to be assigned is already
+        assigned to this resource. Defaults to `True`.
+
+    Examples:
+      Align left-front-bottom (default behavior):
+
+      >>> parent = Resource("parent", size_x=100, size_y=100, size_z=10)
+      >>> child = Resource("child", size_x=80, size_y=80, size_z=5)
+      >>> parent.assign_child_by_anchor(child)  # Both default to LFB
+
+      Align the center-center-bottom using tuple syntax:
+
+      >>> parent.assign_child_by_anchor(child, parent_anchor=("c", "c", "b"),
+      ...                               child_anchor=("c", "c", "b"))
+
+      Align the center-center-bottom using string syntax:
+
+      >>> parent.assign_child_by_anchor(child, parent_anchor="ccb", child_anchor="ccb")
+
+      Stack on top by aligning parent's top with child's bottom:
+
+      >>> parent.assign_child_by_anchor(child, parent_anchor="lft", child_anchor="lfb")
+    """
+
+    location = _compute_location_from_anchors(
+      parent=self, child=resource, parent_anchor=parent_anchor, child_anchor=child_anchor
+    )
+    self.assign_child_resource(resource=resource, location=location, reassign=reassign)
+
   # Helper methods to call all callbacks. These are used to propagate callbacks up the tree.
   def _call_will_assign_resource_callbacks(self, resource: Resource):
     for callback in self._will_assign_resource_callbacks:
@@ -369,11 +480,25 @@ class Resource:
       msg = " ".join(msgs)
       raise ValueError(msg)
 
+    # Prevent cycles (dropping an ancestor into its own subtree)
+    if self.is_in_subtree_of(resource):
+      raise ValueError(f"Cannot drop '{resource.name}' onto '{self.name}': would create a cycle.")
+
   def get_root(self) -> Resource:
     """Get the root of the resource tree."""
     if self.parent is None:
       return self
     return self.parent.get_root()
+
+  def is_in_subtree_of(self, other: Resource) -> bool:
+    """Return ``True`` if ``self`` is in the subtree rooted at ``other``."""
+
+    current: Optional[Resource] = self
+    while current is not None:
+      if current is other:
+        return True
+      current = current.parent
+    return False
 
   def _check_naming_conflicts(self, resource: Resource):
     """Recursively check for naming conflicts in the resource tree."""
@@ -480,6 +605,12 @@ class Resource:
     """Return a copy of this resource at the given location."""
     new_resource = self.copy()
     new_resource.location = location
+    return new_resource
+
+  def named(self, name: str) -> Self:
+    """Return a copy of this resource with the given name."""
+    new_resource = self.copy()
+    new_resource.name = name
     return new_resource
 
   def center(self, x: bool = True, y: bool = True, z: bool = False) -> Coordinate:
@@ -790,9 +921,30 @@ class Resource:
     this method might not return the correct value.
     ```
     """
-    heighest_point = self.get_absolute_location(z="t").z
+    highest_point = self.get_absolute_location(z="t").z
     if self.name == "deck":
-      heighest_point = 0
+      highest_point = 0
     for resource in self.children:
-      heighest_point = max(heighest_point, resource.get_highest_known_point())
-    return heighest_point
+      highest_point = max(highest_point, resource.get_highest_known_point())
+    return highest_point
+
+  def check_can_drop_resource_here(self, resource: Resource, *, reassign: bool = True) -> None:
+    """Validate whether `resource` may be dropped onto this resource.
+
+    Non-mutating preflight check used before assignment (e.g., drag/drop, LiquidHandler).
+    Enforces generic tree/assignment rules (reassign semantics, root name conflicts, no cycles).
+    Override in subclasses (and call `super()`) to add domain-specific constraints.
+
+    Raises:
+      ValueError: If the drop/assignment is not allowed.
+    """
+    # Baseline validity checks for attaching `resource` under `self`
+    # (delegated to `_check_assignment` to stay consistent as rules evolve).
+    self._check_assignment(resource=resource, reassign=reassign)
+
+    # Subclasses can add stricter “drop rules” here.
+    # Examples:
+    # - Enforce placement/geometry constraints (must fit, no overlaps, valid coordinates)
+    # - Enforce state/permission rules (locked, read-only, etc.)
+    # Base `Resource` does not impose any of those extra rules beyond the generic
+    # assignment safety checks.

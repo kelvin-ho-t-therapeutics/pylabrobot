@@ -1,29 +1,41 @@
+import asyncio
 import datetime
 import enum
 import functools
 import logging
 import re
+import sys
 import warnings
 from abc import ABCMeta
 from contextlib import asynccontextmanager, contextmanager
+from dataclasses import dataclass
 from typing import (
+  Any,
   Callable,
+  Coroutine,
   Dict,
   List,
   Literal,
   Optional,
   Sequence,
+  Tuple,
   Type,
   TypeVar,
   Union,
   cast,
 )
 
+if sys.version_info < (3, 10):
+  from typing_extensions import Concatenate, ParamSpec
+else:
+  from typing import Concatenate, ParamSpec
+
 from pylabrobot import audio
 from pylabrobot.heating_shaking.hamilton_backend import HamiltonHeaterShakerInterface
 from pylabrobot.liquid_handling.backends.hamilton.base import (
   HamiltonLiquidHandler,
 )
+from pylabrobot.liquid_handling.backends.hamilton.common import fill_in_defaults
 from pylabrobot.liquid_handling.errors import ChannelizedError
 from pylabrobot.liquid_handling.liquid_classes.hamilton import (
   HamiltonLiquidClass,
@@ -39,6 +51,7 @@ from pylabrobot.liquid_handling.standard import (
   MultiHeadDispensePlate,
   Pickup,
   PickupTipRack,
+  PipettingOp,
   ResourceDrop,
   ResourceMove,
   ResourcePickup,
@@ -51,13 +64,16 @@ from pylabrobot.liquid_handling.utils import (
 )
 from pylabrobot.resources import (
   Carrier,
+  Container,
   Coordinate,
+  Plate,
   Resource,
   Tip,
   TipRack,
   TipSpot,
   Well,
 )
+from pylabrobot.resources.barcode import Barcode, Barcode1DSymbology
 from pylabrobot.resources.errors import (
   HasTipError,
   NoTipError,
@@ -71,8 +87,8 @@ from pylabrobot.resources.hamilton import (
   TipSize,
 )
 from pylabrobot.resources.hamilton.hamilton_decks import (
-  STAR_SIZE_X,
-  STARLET_SIZE_X,
+  HamiltonCoreGrippers,
+  rails_for_x_coordinate,
 )
 from pylabrobot.resources.liquid import Liquid
 from pylabrobot.resources.rotation import Rotation
@@ -83,39 +99,28 @@ T = TypeVar("T")
 
 logger = logging.getLogger("pylabrobot")
 
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
 
-def need_iswap_parked(method: Callable):
+
+def need_iswap_parked(
+  method: Callable[Concatenate["STARBackend", _P], Coroutine[Any, Any, _R]],
+) -> Callable[Concatenate["STARBackend", _P], Coroutine[Any, Any, _R]]:
   """Ensure that the iSWAP is in parked position before running command.
 
   If the iSWAP is not parked, it get's parked before running the command.
   """
 
   @functools.wraps(method)
-  async def wrapper(self: "STAR", *args, **kwargs):
+  async def wrapper(self: "STARBackend", *args, **kwargs):
     if self.iswap_installed and not self.iswap_parked:
       await self.park_iswap(
         minimum_traverse_height_at_beginning_of_a_command=int(self._iswap_traversal_height * 10)
       )
 
-    result = await method(self, *args, **kwargs)
-
-    return result
+    return await method(self, *args, **kwargs)
 
   return wrapper
-
-
-def _fill_in_defaults(val: Optional[List[T]], default: List[T]) -> List[T]:
-  """Util for converting an argument to the appropriate format for low level star methods."""
-  # if the val is None, use the default.
-  if val is None:
-    return default
-  # if the val is a list, it must be of the correct length.
-  if len(val) != len(default):
-    raise ValueError(f"Value length must equal num operations ({len(default)}), but is {val}")
-  # replace None values in list with default values.
-  val = [v if v is not None else d for v, d in zip(val, default)]
-  # the value is ready to be used.
-  return val
 
 
 def parse_star_fw_string(resp: str, fmt: str = "") -> dict:
@@ -470,7 +475,7 @@ class ElementStillHoldingError(STARModuleError):
   """Element still holding
 
   Possible cause(s):
-    "Get command" is sent twice or element is not droped expected element is missing (lost)
+    "Get command" is sent twice or element is not dropped expected element is missing (lost)
 
   Code: 22
   """
@@ -893,15 +898,19 @@ def trace_information_to_string(module_identifier: str, trace_information: int) 
       61: "Z-drive not initialized",
       62: "Z-drive movement error",
       63: "Z-drive limit stop not found",
-      70: "No liquid level found (possibly because no liquid was present)",
-      71: "Not enough liquid present (Immersion depth or surface following position possiby"
+      65: "Squeezer drive blocked. Can you manually unblock the squeezer drive by turning its screw?",
+      66: "Squeezer drive not initialized",
+      67: "Squeezer drive movement error: Step loss",
+      68: "Init position adjustment error",
+      70: "No liquid level found (possibly because no liquid was present, or too little liquid was present to trigger cLLD)",
+      71: "Not enough liquid present (Immersion depth or surface following position possibly"
       "below minimal access range)",
       72: "Auto calibration at pressure (Sensor not possible)",
       73: "No liquid level found with dual LLD",
       74: "Liquid at a not allowed position detected",
       75: "No tip picked up, possibly because no was present at specified position",
       76: "Tip already picked up",
-      77: "Tip not droped",
+      77: "Tip not dropped",
       78: "Wrong tip picked up",
       80: "Liquid not correctly aspirated",
       81: "Clot detected",
@@ -911,9 +920,9 @@ def trace_information_to_string(module_identifier: str, trace_information: int) 
       85: "No communication to digital potentiometer",
       86: "ADC algorithm error",
       87: "2nd phase of liquid nt found",
-      88: "Not enough liquid present (Immersion depth or surface following position possiby"
+      88: "Not enough liquid present (Immersion depth or surface following position possibly"
       "below minimal access range)",
-      90: "Limit curve not resetable",
+      90: "Limit curve not resettable",
       91: "Limit curve not programmable",
       92: "Limit curve not found",
       93: "Limit curve data incorrect",
@@ -987,7 +996,7 @@ def trace_information_to_string(module_identifier: str, trace_information: int) 
       86: "Gripper drive: Auto adjustment of DMS digital potentiometer not possible",
       89: "Gripper drive movement error: drive locked or incremental sensor fault during gripping",
       90: "Gripper drive initialized failed",
-      91: "iSWAP not initialized. Call star.initialize_iswap().",
+      91: "iSWAP not initialized. Call STARBackend.initialize_iswap().",
       92: "Gripper drive movement error: drive locked or incremental sensor fault during release",
       93: "Gripper drive movement error: position counter over/underflow",
       94: "Plate not found",
@@ -1114,8 +1123,23 @@ def _dispensing_mode_for_op(empty: bool, jet: bool, blow_out: bool) -> int:
     return 3 if blow_out else 2
 
 
+@dataclass
+class Head96Information:
+  """Information about the installed 96-head."""
+
+  StopDiscType = Literal["core_i", "core_ii"]
+  InstrumentType = Literal["legacy", "FM-STAR"]
+  HeadType = Literal["Low volume head", "High volume head", "96 head II", "96 head TADM", "unknown"]
+
+  fw_version: datetime.date
+  supports_clot_monitoring_clld: bool
+  stop_disc_type: StopDiscType
+  instrument_type: InstrumentType
+  head_type: HeadType
+
+
 class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
-  """Interface for the Hamilton STAR."""
+  """Interface for the Hamilton STARBackend."""
 
   def __init__(
     self,
@@ -1128,9 +1152,9 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
     """Create a new STAR interface.
 
     Args:
-      device_address: the USB device address of the Hamilton STAR. Only useful if using more than
+      device_address: the USB device address of the Hamilton STARBackend. Only useful if using more than
         one Hamilton machine over USB.
-      serial_number: the serial number of the Hamilton STAR. Only useful if using more than one
+      serial_number: the serial number of the Hamilton STARBackend. Only useful if using more than one
         Hamilton machine over USB.
       packet_read_timeout: timeout in seconds for reading a single packet.
       read_timeout: timeout in seconds for reading a full response.
@@ -1161,6 +1185,10 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
 
     self._iswap_version: Optional[str] = None  # loaded lazily
 
+    self._default_1d_symbology: Barcode1DSymbology = "Code 128 (Subset B and C)"
+
+    self._setup_done = False
+
   @property
   def unsafe(self) -> "UnSafe":
     """Actions that have a higher risk of damaging the robot. Use with care!"""
@@ -1175,7 +1203,7 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
 
   def set_minimum_traversal_height(self, traversal_height: float):
     raise NotImplementedError(
-      "set_minimum_traversal_height is depricated. use set_minimum_channel_traversal_height or "
+      "set_minimum_traversal_height is deprecated. use set_minimum_channel_traversal_height or "
       "set_minimum_iswap_traversal_height instead."
     )
 
@@ -1240,7 +1268,8 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
 
   async def request_pip_channel_version(self, channel: int) -> str:
     return cast(
-      str, (await self.send_command(STAR.channel_id(channel), "RF", fmt="rf" + "&" * 17))["rf"]
+      str,
+      (await self.send_command(STARBackend.channel_id(channel), "RF", fmt="rf" + "&" * 17))["rf"],
     )
 
   def get_id_from_fw_response(self, resp: str) -> Optional[int]:
@@ -1336,8 +1365,40 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
     """Parse a response from the machine."""
     return parse_star_fw_string(resp, fmt)
 
+  def _parse_firmware_version_datetime(self, fw_version: str) -> datetime.date:
+    """Extract datetime from firmware version string.
+
+    Args:
+      fw_version: Firmware version string (e.g., "v2021.03.15" or "2023_Q2_v1.4")
+
+    Returns:
+      A datetime object representing the extracted date
+    """
+
+    # Prefer full date patterns like YYYY.MM.DD / YYYY_MM_DD / YYYY-MM-DD
+    date_match = re.search(r"\b(20\d{2})[._-](\d{2})[._-](\d{2})\b", fw_version)
+    if date_match:
+      y, m, d = map(int, date_match.groups())
+      return datetime.date(y, m, d)
+
+    # Handle quarter formats like 2023_Q2 -> first day of the quarter
+    q_match = re.search(r"\b(20\d{2})_Q([1-4])\b", fw_version, flags=re.IGNORECASE)
+    if q_match:
+      y = int(q_match.group(1))
+      q = int(q_match.group(2))
+      month = (q - 1) * 3 + 1
+      return datetime.date(y, month, 1)
+
+    # Fall back to year only -> Jan 1st of that year, or None
+    year_match = re.search(r"\b(20\d{2})\b", fw_version)
+    if year_match is None:
+      raise ValueError(f"Could not parse year from firmware version string: '{fw_version}'")
+    return datetime.date(int(year_match.group(1)), 1, 1)
+
   async def setup(
     self,
+    skip_instrument_initialization=False,
+    skip_pip=False,
     skip_autoload=False,
     skip_iswap=False,
     skip_core96_head=False,
@@ -1354,9 +1415,6 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
 
     self.id_ = 0
 
-    tip_presences = await self.request_tip_presence()
-    self._num_channels = len(tip_presences)
-
     # Request machine information
     conf = await self.request_machine_configuration()
     self._extended_conf = await self.request_extended_configuration()
@@ -1372,58 +1430,126 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
     self.autoload_installed = autoload_configuration_byte == "1"
     self.core96_head_installed = left_x_drive_configuration_byte_1[2] == "1"
     self.iswap_installed = left_x_drive_configuration_byte_1[1] == "1"
+    self._head96_information: Optional[Head96Information] = None
 
     initialized = await self.request_instrument_initialization_status()
 
     if not initialized:
-      logger.info("Running backend initialization procedure.")
+      if not skip_instrument_initialization:
+        logger.info("Running backend initialization procedure.")
 
-      await self.pre_initialize_instrument()
+        await self.pre_initialize_instrument()
+    else:
+      # pre_initialize only runs when the robot is not initialized
+      # pre_initialize will move all channels to Z safety
+      # so if we skip pre_initialize, we need to raise the channels ourselves
+      await self.move_all_channels_in_z_safety()
+      if self.core96_head_installed:
+        await self.move_core_96_to_safe_position()
 
-    if not initialized or any(tip_presences):
-      dy = (4050 - 2175) // (self.num_channels - 1)
-      y_positions = [4050 - i * dy for i in range(self.num_channels)]
+    tip_presences = await self.request_tip_presence()
+    self._num_channels = len(tip_presences)
 
-      await self.initialize_pipetting_channels(
-        x_positions=[self.extended_conf["xw"]],  # Tip eject waste X position.
-        y_positions=y_positions,
-        begin_of_tip_deposit_process=int(self._channel_traversal_height * 10),
-        end_of_tip_deposit_process=1220,
-        z_position_at_end_of_a_command=3600,
-        tip_pattern=[True] * self.num_channels,
-        tip_type=4,  # TODO: get from tip types
-        discarding_method=0,
-      )
+    async def set_up_pip():
+      if (not initialized or any(tip_presences)) and not skip_pip:
+        await self.initialize_pip()
 
-    if self.autoload_installed and not skip_autoload:
-      autoload_initialized = await self.request_autoload_initialization_status()
-      if not autoload_initialized:
-        await self.initialize_autoload()
+    async def set_up_autoload():
+      if self.autoload_installed and not skip_autoload:
+        autoload_initialized = await self.request_autoload_initialization_status()
+        if not autoload_initialized:
+          await self.initialize_autoload()
 
-      await self.park_autoload()
+        await self.park_autoload()
 
-    if self.iswap_installed and not skip_iswap:
-      iswap_initialized = await self.request_iswap_initialization_status()
-      if not iswap_initialized:
-        await self.initialize_iswap()
+    async def set_up_iswap():
+      if self.iswap_installed and not skip_iswap:
+        iswap_initialized = await self.request_iswap_initialization_status()
+        if not iswap_initialized:
+          await self.initialize_iswap()
 
-      await self.park_iswap(
-        minimum_traverse_height_at_beginning_of_a_command=int(self._iswap_traversal_height * 10)
-      )
-
-    if self.core96_head_installed and not skip_core96_head:
-      core96_head_initialized = await self.request_core_96_head_initialization_status()
-      if not core96_head_initialized:
-        await self.initialize_core_96_head(
-          trash96=self.deck.get_trash_area96(),
-          z_position_at_the_command_end=self._channel_traversal_height,
+        await self.park_iswap(
+          minimum_traverse_height_at_beginning_of_a_command=int(self._iswap_traversal_height * 10)
         )
+
+    async def set_up_core96_head():
+      if self.core96_head_installed and not skip_core96_head:
+        # Initialize 96-head
+        core96_head_initialized = await self.request_core_96_head_initialization_status()
+        if not core96_head_initialized:
+          await self.initialize_core_96_head(
+            trash96=self.deck.get_trash_area96(),
+            z_position_at_the_command_end=self._channel_traversal_height,
+          )
+
+        # Cache firmware version and configuration for version-specific behavior
+        fw_version = await self.head96_request_firmware_version()
+        configuration_96head = await self._head96_request_configuration()
+        head96_type = await self.head96_request_type()
+
+        self._head96_information = Head96Information(
+          fw_version=fw_version,
+          supports_clot_monitoring_clld=bool(int(configuration_96head[0])),
+          stop_disc_type="core_i" if configuration_96head[1] == "0" else "core_ii",
+          instrument_type="legacy" if configuration_96head[2] == "0" else "FM-STAR",
+          head_type=head96_type,
+        )
+
+    async def set_up_arm_modules():
+      await set_up_pip()
+      await set_up_iswap()
+      await set_up_core96_head()
+
+    await asyncio.gather(set_up_autoload(), set_up_arm_modules())
 
     # After setup, STAR will have thrown out anything mounted on the pipetting channels, including
     # the core grippers.
     self._core_parked = True
 
+    self._setup_done = True
+
+  async def stop(self):
+    await super().stop()
+    self._setup_done = False
+
+  @property
+  def setup_done(self) -> bool:
+    return self._setup_done
+
   # ============== LiquidHandlerBackend methods ==============
+
+  def can_reach_position(self, channel_idx: int, position: Coordinate) -> bool:
+    """Check if a position is reachable by a channel (center-based)."""
+    if not (0 <= channel_idx < self.num_channels):
+      raise ValueError(f"Channel {channel_idx} is out of range for this robot.")
+
+    # frontmost channel can go to y=6, every channel after that is about 8.9 mm further back
+    min_y_pos = 6 + 8.9 * (self.num_channels - channel_idx - 1)
+    if position.y < min_y_pos:
+      return False
+
+    # backmost channel can go to y=601.6, every channel before that is about 8.9 mm further forward
+    max_y_pos = 601.6 - 8.9 * channel_idx
+    if position.y > max_y_pos:
+      return False
+
+    return True
+
+  def ensure_can_reach_position(
+    self, use_channels: List[int], ops: Sequence[PipettingOp], op_name: str
+  ):
+    locs = [(op.resource.get_location_wrt(self.deck, y="c") + op.offset) for op in ops]
+    cant_reach = [
+      channel_idx
+      for channel_idx, loc in zip(use_channels, locs)
+      if not self.can_reach_position(channel_idx, loc)
+    ]
+    if len(cant_reach) > 0:
+      raise ValueError(
+        f"Channels {cant_reach} cannot reach their target positions in '{op_name}' operation.\n"
+        "Robots with more than 8 channels have limited Y-axis reach per channel; they don't have random access to the full deck area.\n"
+        "Try the operation with different channels or a different target position (i.e. different labware placement)."
+      )
 
   async def pick_up_tips(
     self,
@@ -1436,15 +1562,17 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
   ):
     """Pick up tips from a resource."""
 
+    self.ensure_can_reach_position(use_channels, ops, "pick_up_tips")
+
     x_positions, y_positions, channels_involved = self._ops_to_fw_positions(ops, use_channels)
 
     tip_spots = [op.resource for op in ops]
     tips = set(cast(HamiltonTip, tip_spot.get_tip()) for tip_spot in tip_spots)
     if len(tips) > 1:
       raise ValueError("Cannot mix tips with different tip types.")
-    ttti = (await self.get_ttti(list(tips)))[0]
+    ttti = await self.get_or_assign_tip_type_index(tips.pop())
 
-    max_z = max(op.resource.get_absolute_location().z + op.offset.z for op in ops)
+    max_z = max(op.resource.get_location_wrt(self.deck).z + op.offset.z for op in ops)
     max_total_tip_length = max(op.tip.total_tip_length for op in ops)
     max_tip_length = max((op.tip.total_tip_length - op.tip.fitting_depth) for op in ops)
 
@@ -1509,6 +1637,8 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
         default if *all* tips are being dropped to a tip spot.
     """
 
+    self.ensure_can_reach_position(use_channels, ops, "drop_tips")
+
     if drop_method is None:
       if any(not isinstance(op.resource, TipSpot) for op in ops):
         drop_method = TipDropMethod.PLACE_SHIFT
@@ -1518,7 +1648,7 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
     x_positions, y_positions, channels_involved = self._ops_to_fw_positions(ops, use_channels)
 
     # get highest z position
-    max_z = max(op.resource.get_absolute_location().z + op.offset.z for op in ops)
+    max_z = max(op.resource.get_location_wrt(self.deck).z + op.offset.z for op in ops)
     if drop_method == TipDropMethod.PLACE_SHIFT:
       # magic values empirically found in https://github.com/PyLabRobot/pylabrobot/pull/63
       begin_tip_deposit_process = (
@@ -1575,9 +1705,9 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
   def _assert_valid_resources(self, resources: Sequence[Resource]) -> None:
     """Assert that resources are in a valid location for pipetting."""
     for resource in resources:
-      if resource.get_absolute_location().z < 100:
+      if resource.get_location_wrt(self.deck).z < 100:
         raise ValueError(
-          f"Resource {resource} is too low: {resource.get_absolute_location().z} < 100"
+          f"Resource {resource} is too low: {resource.get_location_wrt(self.deck).z} < 100"
         )
 
   class LLDMode(enum.Enum):
@@ -1588,6 +1718,403 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
     PRESSURE = 2
     DUAL = 3
     Z_TOUCH_OFF = 4
+
+  class PressureLLDMode(enum.Enum):
+    """Pressure liquid level detection mode."""
+
+    LIQUID = 0
+    FOAM = 1
+
+  async def probe_liquid_heights(
+    self,
+    containers: List[Container],
+    use_channels: Optional[List[int]] = None,
+    resource_offsets: Optional[List[Coordinate]] = None,
+    lld_mode: LLDMode = LLDMode.GAMMA,
+    search_speed: float = 10.0,
+    n_replicates: int = 1,
+    move_to_z_safety_after: bool = True,
+  ) -> List[float]:
+    """Probe liquid surface heights in containers using liquid level detection.
+
+    Performs capacitive or pressure-based liquid level detection (LLD) by moving channels to
+    container positions and sensing the liquid surface. Heights are measured from the bottom
+    of each container's cavity.
+
+    Args:
+      containers: List of Container objects to probe, one per channel.
+      use_channels: Channel indices to use for probing (0-indexed).
+      resource_offsets: Optional XYZ offsets from container centers. Auto-calculated for single containers with odd channel counts to avoid center dividers. Defaults to container centers.
+      lld_mode: Detection mode - LLDMode(1) for capacitive, LLDMode(2) for pressure-based. Defaults to capacitive.
+      search_speed: Z-axis search speed in mm/s. Default 10.0 mm/s.
+      n_replicates: Number of measurements per channel. Default 1.
+      move_to_z_safety_after: Whether to move channels to safe Z height after probing. Default True.
+
+    Returns:
+      Mean of measured liquid heights for each container (mm from cavity bottom).
+
+    Raises:
+      RuntimeError: If channels lack tips.
+      NotImplementedError: If channels require different X positions.
+
+    Notes:
+      - All specified channels must have tips attached
+      - All channels must be at the same X position (single-row operation)
+      - For single containers with odd channel counts, Y-offsets are applied to avoid
+        center dividers (Hamilton 1000 uL spacing: 9mm, offset: 5.5mm)
+    """
+
+    if use_channels is None:
+      use_channels = list(range(len(containers)))
+
+    # Handle tip positioning ... if SINGLE container instance
+    if resource_offsets is None:
+      if len(set(containers)) == 1:
+        resource_offsets = get_wide_single_resource_liquid_op_offsets(
+          resource=containers[0], num_channels=len(containers)
+        )
+
+        if len(use_channels) % 2 != 0:
+          # Hamilton 1000 uL channels are 9 mm apart, so offset by half the distance
+          # + extra for the potential central 'splash guard'
+          y_offset = 5.5
+          resource_offsets = [
+            resource_offsets[i] + Coordinate(0, y_offset, 0) for i in range(len(use_channels))
+          ]
+
+    resource_offsets = resource_offsets or [Coordinate.zero()] * len(containers)
+
+    # Validate parameters.
+    if lld_mode not in {self.LLDMode.GAMMA, self.LLDMode.PRESSURE}:
+      raise ValueError(f"LLDMode must be 1 (capacitive) or 2 (pressure-based), is {lld_mode}")
+
+    if not len(containers) == len(use_channels) == len(resource_offsets):
+      raise ValueError(
+        "Length of containers, use_channels, resource_offsets and tip_lengths must match."
+        f"are {len(containers)}, {len(use_channels)}, {len(resource_offsets)}."
+      )
+
+    # Make sure we have tips on all channels and know their lengths
+    tip_presence = await self.request_tip_presence()
+    if not all(tip_presence[idx] for idx in use_channels):
+      raise RuntimeError("All specified channels must have tips attached.")
+
+    tip_lengths = [await self.request_tip_len_on_channel(channel_idx=idx) for idx in use_channels]
+
+    # Move channels to safe Z height before starting
+    await self.move_all_channels_in_z_safety()
+
+    # Check if all channels are on the same x position, then move there
+    x_pos = [
+      resource.get_location_wrt(self.deck, x="c", y="c", z="b").x + offset.x
+      for resource, offset in zip(containers, resource_offsets)
+    ]
+    if len(set(x_pos)) > 1:  # TODO: implement
+      raise NotImplementedError(
+        "probe_liquid_heights is not yet supported for multiple x positions."
+      )
+    await self.move_channel_x(0, x_pos[0])
+
+    # Move channels to their y positions
+    y_pos = [
+      resource.get_location_wrt(self.deck, x="c", y="c", z="b").y + offset.y
+      for resource, offset in zip(containers, resource_offsets)
+    ]
+    await self.position_channels_in_y_direction(
+      {channel: y for channel, y in zip(use_channels, y_pos)}
+    )
+
+    # Detect liquid heights
+    absolute_heights_measurements: Dict[int, List[float]] = {ch: [] for ch in use_channels}
+
+    lowest_immers_positions = [
+      container.get_absolute_location("c", "c", "cavity_bottom").z
+      + tip_len
+      - self.DEFAULT_TIP_FITTING_DEPTH
+      for container, tip_len in zip(containers, tip_lengths)
+    ]
+    start_pos_searches = [
+      container.get_absolute_location("c", "c", "t").z
+      + tip_len
+      - self.DEFAULT_TIP_FITTING_DEPTH
+      + 5
+      for container, tip_len in zip(containers, tip_lengths)
+    ]
+
+    try:
+      for _ in range(n_replicates):
+        if lld_mode == self.LLDMode.GAMMA:
+          await asyncio.gather(
+            *[
+              self._move_z_drive_to_liquid_surface_using_clld(
+                channel_idx=channel,
+                lowest_immers_pos=lip,
+                start_pos_search=sps,
+                channel_speed=search_speed,
+              )
+              for channel, lip, sps in zip(
+                use_channels, lowest_immers_positions, start_pos_searches
+              )
+            ]
+          )
+
+        else:
+          await asyncio.gather(
+            *[
+              self._search_for_surface_using_plld(
+                channel_idx=channel,
+                lowest_immers_pos=lip,
+                start_pos_search=sps,
+                channel_speed=search_speed,
+                dispense_drive_speed=5.0,
+                plld_mode=self.PressureLLDMode.LIQUID,
+                clld_verification=False,
+                post_detection_dist=0.0,
+              )
+              for channel, lip, sps in zip(
+                use_channels, lowest_immers_positions, start_pos_searches
+              )
+            ]
+          )
+
+        # Get heights for ALL channels (indexed 0 to self.num_channels-1) but only store for used channels
+        current_absolute_liquid_heights = await self.request_pip_height_last_lld()
+        for ch_idx in use_channels:
+          height = current_absolute_liquid_heights[ch_idx]
+          absolute_heights_measurements[ch_idx].append(height)
+    except:
+      await self.move_all_channels_in_z_safety()
+      raise
+
+    # Compute average heights per channel and convert to relative to well bottom
+    absolute_liquid_heights = [
+      sum(absolute_heights_measurements[ch]) / len(absolute_heights_measurements[ch])
+      for ch in use_channels
+    ]
+
+    relative_to_well = [
+      absolute_liquid_height - resource.get_absolute_location("c", "c", "cavity_bottom").z
+      for resource, absolute_liquid_height in zip(containers, absolute_liquid_heights)
+    ]
+
+    if move_to_z_safety_after:
+      await self.move_all_channels_in_z_safety()
+
+    return relative_to_well
+
+  async def probe_liquid_volumes(
+    self,
+    containers: List[Container],
+    use_channels: List[int],
+    resource_offsets: Optional[List[Coordinate]] = None,
+    lld_mode: LLDMode = LLDMode.GAMMA,
+    search_speed: float = 10.0,
+    n_replicates: int = 3,
+    move_to_z_safety_after: bool = True,
+  ) -> List[float]:
+    """Probe liquid volumes in containers by measuring heights and converting to volumes.
+
+    Performs liquid level detection to measure surface heights, then converts heights to
+    volumes using each container's geometric model. This is a convenience wrapper around
+    probe_liquid_heights that handles the height-to-volume conversion.
+
+    Args:
+      containers: List of Container objects to probe, one per channel. All must support height-to-volume conversion via compute_volume_from_height().
+      use_channels: Channel indices to use for probing (0-indexed).
+      resource_offsets: Optional XYZ offsets from container centers. Auto-calculated for single containers with odd channel counts. Defaults to container centers.
+      lld_mode: Detection mode - LLDMode(1) for capacitive, LLDMode(2) for pressure-based.  Defaults to capacitive.
+      search_speed: Z-axis search speed in mm/s. Default 10.0 mm/s.
+      n_replicates: Number of measurements per channel. Default 3.
+      move_to_z_safety_after: Whether to move channels to safe Z height after probing. Default True.
+
+    Returns:
+      Volumes in each container (uL).
+
+    Raises:
+      ValueError: If any container doesn't support height-to-volume conversion (raised by probe_liquid_heights).
+      NotImplementedError: If channels require different X positions.
+
+    Notes:
+    - Delegates all motion, LLD, validation, and safety logic to probe_liquid_heights
+    - All containers must support height-volume functions. Volume calculation uses Container.compute_volume_from_height()
+    """
+
+    if any(not resource.supports_compute_height_volume_functions() for resource in containers):
+      raise ValueError(
+        "probe_liquid_volumes can only be used with containers that support height<->volume functions."
+      )
+
+    liquid_heights = await self.probe_liquid_heights(
+      containers=containers,
+      use_channels=use_channels,
+      resource_offsets=resource_offsets,
+      lld_mode=lld_mode,
+      search_speed=search_speed,
+      n_replicates=n_replicates,
+      move_to_z_safety_after=move_to_z_safety_after,
+    )
+
+    return [
+      container.compute_volume_from_height(height)
+      for container, height in zip(containers, liquid_heights)
+    ]
+
+  # # # Granular channel control methods # # #
+
+  DISPENSING_DRIVE_VOL_LIMIT_BOTTOM = -45  # vol TODO: confirm with others
+  DISPENSING_DRIVE_VOL_LIMIT_TOP = 1_250  # vol
+
+  async def channel_dispensing_drive_request_position(self, channel_idx: int) -> float:
+    """Request the current position of the channel's dispensing drive"""
+
+    if not (0 <= channel_idx < self.num_channels):
+      raise ValueError(f"channel_idx must be between 0 and {self.num_channels-1}")
+
+    resp = await self.send_command(
+      module=STARBackend.channel_id(channel_idx), command="RD", fmt="rd##### #####"
+    )
+    return STARBackend.dispensing_drive_increment_to_volume(resp["rd"])
+
+  async def channel_dispensing_drive_move_to_volume_position(
+    self,
+    channel_idx: int,
+    vol: float,
+    flow_rate: float = 200.0,  # uL/sec
+    acceleration: float = 3000.0,  # uL/sec**2,
+    current_limit: int = 5,
+  ):
+    """Move channel's dispensing drive to specified volume position
+
+    Args:
+      channel_idx: Index of the channel to move (0-indexed).
+      vol: Target volume position to move the dispensing drive piston to (uL).
+      flow_rate: Speed of the movement (uL/sec). Default is 200.0 uL/sec.
+      acceleration: Acceleration of the movement (uL/sec**2). Default is 3000.0 uL/sec**2.
+      current_limit: Current limit for the drive (1-7). Default is 5.
+    """
+
+    if not (self.DISPENSING_DRIVE_VOL_LIMIT_BOTTOM <= vol <= self.DISPENSING_DRIVE_VOL_LIMIT_TOP):
+      raise ValueError(
+        f"Target dispensing Drive vol must be between {self.DISPENSING_DRIVE_VOL_LIMIT_BOTTOM}"
+        f" and {self.DISPENSING_DRIVE_VOL_LIMIT_TOP}, is {vol}"
+      )
+    if not (0.9 <= flow_rate <= 632.8):
+      raise ValueError(
+        f"Dispensing drive speed must be between 0.9 and 632.8 uL/sec, is {flow_rate}"
+      )
+    if not (234.4 <= acceleration <= 28125.6):
+      raise ValueError(
+        f"Dispensing drive acceleration must be between 234.4 and 28125.6 uL/sec**2, is {acceleration}"
+      )
+    if not (1 <= current_limit <= 7):
+      raise ValueError(
+        f"Dispensing drive current limit must be between 1 and 7, is {current_limit}"
+      )
+
+    current_position = await self.channel_dispensing_drive_request_position(channel_idx=channel_idx)
+    relative_vol_movement = round(vol - current_position, 1)
+    relative_vol_movement_increment = STARBackend.dispensing_drive_vol_to_increment(
+      abs(relative_vol_movement)
+    )
+    speed_increment = STARBackend.dispensing_drive_vol_to_increment(flow_rate)
+    acceleration_increment = STARBackend.dispensing_drive_vol_to_increment(acceleration)
+    acceleration_increment_thousands = round(acceleration_increment * 0.001)
+
+    await self.send_command(
+      module=STARBackend.channel_id(channel_idx),
+      command="DS",
+      ds=f"{relative_vol_movement_increment:05}",
+      dt="0" if relative_vol_movement >= 0 else "1",
+      dv=f"{speed_increment:05}",
+      dr=f"{acceleration_increment_thousands:03}",
+      dw=f"{current_limit}",
+    )
+
+  async def empty_tip(
+    self,
+    channel_idx: int,
+    vol: Optional[float] = None,
+    flow_rate: float = 200.0,  # vol/sec
+    acceleration: float = 3000.0,  # vol/sec**2,
+    current_limit: int = 5,
+    reset_dispensing_drive_after: bool = True,
+  ):
+    """Empty tip by moving to `vol` (default bottom limit), optionally returning plunger position to 0.
+
+    Args:
+      channel_idx: Index of the channel to empty (0-indexed).
+      vol: Target volume position to move the dispensing drive piston to (uL). If None, defaults to bottom limit.
+      flow_rate: Speed of the movement (uL/sec). Default is 200.0 uL/sec.
+      acceleration: Acceleration of the movement (uL/sec**2). Default is 3000.0 uL/sec**2.
+      current_limit: Current limit for the drive (1-7). Default is 5.
+      reset_dispensing_drive_after: Whether to return the dispensing drive to 0 after emptying. Default is True
+    """
+
+    if vol is None:
+      vol = self.DISPENSING_DRIVE_VOL_LIMIT_BOTTOM
+
+    # Empty tip
+    await self.channel_dispensing_drive_move_to_volume_position(
+      channel_idx=channel_idx,
+      vol=vol,
+      flow_rate=flow_rate,
+      acceleration=acceleration,
+      current_limit=current_limit,
+    )
+
+    if reset_dispensing_drive_after:
+      # Reset only channel used back to vol=0.0 position
+      await self.channel_dispensing_drive_move_to_volume_position(
+        channel_idx=channel_idx,
+        vol=0,
+        flow_rate=flow_rate,
+        acceleration=acceleration,
+        current_limit=current_limit,
+      )
+
+  async def empty_tips(
+    self,
+    channels: Optional[List[int]] = None,
+    vol: Optional[float] = None,
+    flow_rate: float = 200.0,  # vol/sec
+    acceleration: float = 3000.0,  # vol/sec**2,
+    current_limit: int = 5,
+    reset_dispensing_drive_after: bool = True,
+  ):
+    """Empty multiple tips by moving to `vol` (default bottom limit), optionally returning plunger position to 0.
+
+    Args:
+      channels: List of channel indices to empty (0-indexed). If None, all channels with tips mounted are emptied.
+      vol: Target volume position to move the dispensing drive piston to (uL). If None, defaults to bottom limit.
+      flow_rate: Speed of the movement (uL/sec). Default is 200.0 uL/sec.
+      acceleration: Acceleration of the movement (uL/sec**2). Default is 3000.0 uL/sec**2.
+      current_limit: Current limit for the drive (1-7). Default is 5.
+      reset_dispensing_drive_after: Whether to return the dispensing drive to 0 after emptying. Default is True
+    """
+
+    if channels is None:
+      channel_occupancy = await self.request_tip_presence()
+      channels = [ch for ch, occupied in enumerate(channel_occupancy) if occupied]
+    else:
+      # Validate that all provided channels are within valid range
+      if not all(0 <= ch < self.num_channels for ch in channels):
+        raise ValueError(f"channel_idx must be between 0 and {self.num_channels-1}, got {channels}")
+
+    await asyncio.gather(
+      *[
+        self.empty_tip(
+          channel_idx=ch,
+          vol=vol,
+          flow_rate=flow_rate,
+          acceleration=acceleration,
+          current_limit=current_limit,
+          reset_dispensing_drive_after=reset_dispensing_drive_after,
+        )
+        for ch in channels
+      ]
+    )
+
+  # # # Channel Liquid Handling Commands # # #
 
   async def aspirate(
     self,
@@ -1602,7 +2129,6 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
     second_section_ratio: Optional[List[float]] = None,
     minimum_height: Optional[List[float]] = None,
     immersion_depth: Optional[List[float]] = None,
-    immersion_depth_direction: Optional[List[int]] = None,
     surface_following_distance: Optional[List[float]] = None,
     transport_air_volume: Optional[List[float]] = None,
     pre_wetting_volume: Optional[List[float]] = None,
@@ -1613,10 +2139,7 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
     detection_height_difference_for_dual_lld: Optional[List[float]] = None,
     swap_speed: Optional[List[float]] = None,
     settling_time: Optional[List[float]] = None,
-    mix_volume: Optional[List[float]] = None,
-    mix_cycles: Optional[List[int]] = None,
     mix_position_from_liquid_surface: Optional[List[float]] = None,
-    mix_speed: Optional[List[float]] = None,
     mix_surface_following_distance: Optional[List[float]] = None,
     limit_curve_index: Optional[List[int]] = None,
     use_2nd_section_aspiration: Optional[List[bool]] = None,
@@ -1625,11 +2148,21 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
     dosing_drive_speed_during_2nd_section_search: Optional[List[float]] = None,
     z_drive_speed_during_2nd_section_search: Optional[List[float]] = None,
     cup_upper_edge: Optional[List[float]] = None,
-    ratio_liquid_rise_to_tip_deep_in: Optional[List[float]] = None,
+    ratio_liquid_rise_to_tip_deep_in: Optional[List[int]] = None,
     immersion_depth_2nd_section: Optional[List[float]] = None,
     minimum_traverse_height_at_beginning_of_a_command: Optional[float] = None,
     min_z_endpos: Optional[float] = None,
+    liquid_surface_no_lld: Optional[List[float]] = None,
+    # PLR:
+    probe_liquid_height: bool = False,
+    auto_surface_following_distance: bool = False,
     hamilton_liquid_classes: Optional[List[Optional[HamiltonLiquidClass]]] = None,
+    disable_volume_correction: Optional[List[bool]] = None,
+    # remove >2026-01
+    mix_volume: Optional[List[float]] = None,
+    mix_cycles: Optional[List[int]] = None,
+    mix_speed: Optional[List[float]] = None,
+    immersion_depth_direction: Optional[List[int]] = None,
     liquid_surfaces_no_lld: Optional[List[float]] = None,
   ):
     """Aspirate liquid from the specified channels.
@@ -1650,32 +2183,21 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
       pull_out_distance_transport_air: The distance to pull out when aspirating air, if LLD is
         disabled.
       second_section_height: The height to start the second section of aspiration.
-      second_section_ratio: Unknown.
-      minimum_height: The minimum height to move to, this is the end of aspiration. The channel
-       will move linearly from the liquid surface to this height over the course of the aspiration.
-      immersion_depth: The z distance to move after detecting the liquid, can be into or away from
-        the liquid surface (dependent on immersion_depth_direction).
-      immersion_depth_direction: set to 0, tip will move below the detected liquid surface; set to
-        1, tip will move away from the detected surface.
+      second_section_ratio:
+      minimum_height: The minimum height to move to, this is the end of aspiration. The channel will move linearly from the liquid surface to this height over the course of the aspiration.
+      immersion_depth: The z distance to move after detecting the liquid, can be into or away from the liquid surface.
       surface_following_distance: The distance to follow the liquid surface.
       transport_air_volume: The volume of air to aspirate after the liquid.
       pre_wetting_volume: The volume of liquid to use for pre-wetting.
       lld_mode: The liquid level detection mode to use.
       gamma_lld_sensitivity: The sensitivity of the gamma LLD.
       dp_lld_sensitivity: The sensitivity of the DP LLD.
-      aspirate_position_above_z_touch_off: If the LLD mode is Z_TOUCH_OFF, this is the height above
-        the bottom of the well (presumably) to aspirate from.
-      detection_height_difference_for_dual_lld: Difference between the gamma and DP LLD heights if
-        the LLD mode is DUAL.
-      swap_speed: Swap speed (on leaving liquid) [1mm/s]. Must be between 3 and 1600. Default 100.
+      aspirate_position_above_z_touch_off: If the LLD mode is Z_TOUCH_OFF, this is the height above the bottom of the well (presumably) to aspirate from.
+      detection_height_difference_for_dual_lld: Difference between the gamma and DP LLD heights if the LLD mode is DUAL.
+      swap_speed: Swap speed (on leaving liquid) [mm/s]. Must be between 3 and 1600. Default 100.
       settling_time: The time to wait after mix.
-      mix_volume: The volume to aspirate for mix.
-      mix_cycles: The number of cycles to perform for mix.
-      mix_position_from_liquid_surface: The height to aspirate from for mix
-        (LLD or absolute terms).
-      mix_speed: The speed to aspirate at for mix.
-      mix_surface_following_distance: The distance to follow the liquid surface for
-        mix.
+      mix_position_from_liquid_surface: The height to aspirate from for mix (LLD or absolute terms).
+      mix_surface_following_distance: The distance to follow the liquid surface for mix.
       limit_curve_index: The index of the limit curve to use.
 
       use_2nd_section_aspiration: Whether to use the second section of aspiration.
@@ -1684,19 +2206,43 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
       dosing_drive_speed_during_2nd_section_search: Unknown.
       z_drive_speed_during_2nd_section_search: Unknown.
       cup_upper_edge: Unknown.
-      ratio_liquid_rise_to_tip_deep_in: Unknown.
-      immersion_depth_2nd_section: The depth to move into the liquid for the second section of
-        aspiration.
 
-      minimum_traverse_height_at_beginning_of_a_command: The minimum height to move to before
-        starting an aspiration.
+      minimum_traverse_height_at_beginning_of_a_command: The minimum height to move to before starting an aspiration.
       min_z_endpos: The minimum height to move to, this is the end of aspiration.
 
-      hamilton_liquid_classes: Override the default liquid classes. See
-        pylabrobot/liquid_handling/liquid_classes/hamilton/star.py
-      liquid_surface_no_lld: Liquid surface at function without LLD [mm]. Must be between 0
-          and 360. Defaults to well bottom + liquid height. Should use absolute z.
+      hamilton_liquid_classes: Override the default liquid classes. See pylabrobot/liquid_handling/liquid_classes/hamilton/STARBackend.py
+      liquid_surface_no_lld: Liquid surface at function without LLD [mm]. Must be between 0 and 360. Defaults to well bottom + liquid height. Should use absolute z.
+      disable_volume_correction: Whether to disable liquid class volume correction for each operation.
+
+      probe_liquid_height: PLR-specific parameter. If True, probe the liquid height using cLLD before aspirating to set the liquid_height of every operation instead of using the default 0. Liquid heights must not be set when using this function.
+      auto_surface_following_distance: automatically compute the surface following distance based on the container height<->volume functions. Requires liquid height to be specified or `probe_liquid_height=True`.
     """
+
+    # # # TODO: delete > 2026-01 # # #
+    if mix_volume is not None or mix_cycles is not None or mix_speed is not None:
+      raise NotImplementedError(
+        "Mixing through backend kwargs is deprecated. Use the `mix` parameter of LiquidHandler.aspirate instead. "
+        "https://docs.pylabrobot.org/user_guide/00_liquid-handling/mixing.html"
+      )
+
+    if immersion_depth_direction is not None:
+      warnings.warn(
+        "The immersion_depth_direction parameter is deprecated and will be removed in the future. "
+        "Use positive values for immersion_depth to move into the liquid, and negative values to move "
+        "out of the liquid.",
+        DeprecationWarning,
+      )
+
+    if liquid_surfaces_no_lld is not None:
+      warnings.warn(
+        "The liquid_surfaces_no_lld parameter is deprecated and will be removed in the future. "
+        "Use liquid_surface_no_lld instead.",
+        DeprecationWarning,
+      )
+      liquid_surface_no_lld = liquid_surface_no_lld or liquid_surfaces_no_lld
+    # # # delete # # #
+
+    self.ensure_can_reach_position(use_channels, ops, "aspirate")
 
     x_positions, y_positions, channels_involved = self._ops_to_fw_positions(ops, use_channels)
 
@@ -1710,37 +2256,28 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
     if hamilton_liquid_classes is None:
       hamilton_liquid_classes = []
       for i, op in enumerate(ops):
-        liquid = Liquid.WATER  # default to WATER
-        # [-1][0]: get last liquid in well, [0] is indexing into the tuple
-        if len(op.liquids) > 0 and op.liquids[-1][0] is not None:
-          liquid = op.liquids[-1][0]
-
         hamilton_liquid_classes.append(
           get_star_liquid_class(
             tip_volume=op.tip.maximal_volume,
             is_core=False,
             is_tip=True,
             has_filter=op.tip.has_filter,
-            liquid=liquid,
+            liquid=Liquid.WATER,  # default to WATER
             jet=jet[i],
             blow_out=blow_out[i],
           )
         )
 
-    self._assert_valid_resources([op.resource for op in ops])
-
     # correct volumes using the liquid class
+    disable_volume_correction = fill_in_defaults(disable_volume_correction, [False] * n)
     volumes = [
-      hlc.compute_corrected_volume(op.volume) if hlc is not None else op.volume
-      for op, hlc in zip(ops, hamilton_liquid_classes)
+      hlc.compute_corrected_volume(op.volume) if hlc is not None and not disabled else op.volume
+      for op, hlc, disabled in zip(ops, hamilton_liquid_classes, disable_volume_correction)
     ]
 
     well_bottoms = [
-      op.resource.get_absolute_location().z + op.offset.z + op.resource.material_z_thickness
+      op.resource.get_location_wrt(self.deck).z + op.offset.z + op.resource.material_z_thickness
       for op in ops
-    ]
-    liquid_surfaces_no_lld = liquid_surfaces_no_lld or [
-      wb + (op.liquid_height or 0) for wb, op in zip(well_bottoms, ops)
     ]
     if lld_search_height is None:
       lld_search_height = [
@@ -1751,26 +2288,30 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
       ]
     else:
       lld_search_height = [(wb + sh) for wb, sh in zip(well_bottoms, lld_search_height)]
-    clot_detection_height = _fill_in_defaults(
+    clot_detection_height = fill_in_defaults(
       clot_detection_height,
       default=[
         hlc.aspiration_clot_retract_height if hlc is not None else 0.0
         for hlc in hamilton_liquid_classes
       ],
     )
-    pull_out_distance_transport_air = _fill_in_defaults(pull_out_distance_transport_air, [10] * n)
-    second_section_height = _fill_in_defaults(second_section_height, [3.2] * n)
-    second_section_ratio = _fill_in_defaults(second_section_ratio, [618.0] * n)
-    minimum_height = _fill_in_defaults(minimum_height, well_bottoms)
-    # TODO: I think minimum height should be the minimum height of the well
-    immersion_depth = _fill_in_defaults(immersion_depth, [0.0] * n)
-    immersion_depth_direction = _fill_in_defaults(immersion_depth_direction, [0] * n)
-    surface_following_distance = _fill_in_defaults(surface_following_distance, [0.0] * n)
+    pull_out_distance_transport_air = fill_in_defaults(pull_out_distance_transport_air, [10] * n)
+    second_section_height = fill_in_defaults(second_section_height, [3.2] * n)
+    second_section_ratio = fill_in_defaults(second_section_ratio, [618.0] * n)
+    minimum_height = fill_in_defaults(minimum_height, well_bottoms)
+    if immersion_depth is None:
+      immersion_depth = [0.0] * n
+    immersion_depth_direction = immersion_depth_direction or [
+      0 if (id_ >= 0) else 1 for id_ in immersion_depth
+    ]
+    immersion_depth = [
+      im * (-1 if immersion_depth_direction[i] else 1) for i, im in enumerate(immersion_depth)
+    ]
     flow_rates = [
       op.flow_rate or (hlc.aspiration_flow_rate if hlc is not None else 100.0)
       for op, hlc in zip(ops, hamilton_liquid_classes)
     ]
-    transport_air_volume = _fill_in_defaults(
+    transport_air_volume = fill_in_defaults(
       transport_air_volume,
       default=[
         hlc.aspiration_air_transport_volume if hlc is not None else 0.0
@@ -1781,58 +2322,128 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
       (op.blow_out_air_volume or (hlc.aspiration_blow_out_volume if hlc is not None else 0.0))
       for op, hlc in zip(ops, hamilton_liquid_classes)
     ]
-    pre_wetting_volume = _fill_in_defaults(pre_wetting_volume, [0.0] * n)
-    lld_mode = _fill_in_defaults(lld_mode, [self.__class__.LLDMode.OFF] * n)
-    gamma_lld_sensitivity = _fill_in_defaults(gamma_lld_sensitivity, [1] * n)
-    dp_lld_sensitivity = _fill_in_defaults(dp_lld_sensitivity, [1] * n)
-    aspirate_position_above_z_touch_off = _fill_in_defaults(
+    pre_wetting_volume = fill_in_defaults(pre_wetting_volume, [0.0] * n)
+    lld_mode = fill_in_defaults(lld_mode, [self.__class__.LLDMode.OFF] * n)
+    gamma_lld_sensitivity = fill_in_defaults(gamma_lld_sensitivity, [1] * n)
+    dp_lld_sensitivity = fill_in_defaults(dp_lld_sensitivity, [1] * n)
+    aspirate_position_above_z_touch_off = fill_in_defaults(
       aspirate_position_above_z_touch_off, [0.0] * n
     )
-    detection_height_difference_for_dual_lld = _fill_in_defaults(
+    detection_height_difference_for_dual_lld = fill_in_defaults(
       detection_height_difference_for_dual_lld, [0.0] * n
     )
-    swap_speed = _fill_in_defaults(
+    swap_speed = fill_in_defaults(
       swap_speed,
       default=[
         hlc.aspiration_swap_speed if hlc is not None else 100.0 for hlc in hamilton_liquid_classes
       ],
     )
-    settling_time = _fill_in_defaults(
+    settling_time = fill_in_defaults(
       settling_time,
       default=[
         hlc.aspiration_settling_time if hlc is not None else 0.0 for hlc in hamilton_liquid_classes
       ],
     )
-    mix_volume = _fill_in_defaults(mix_volume, [0.0] * n)
-    mix_cycles = _fill_in_defaults(mix_cycles, [0] * n)
-    mix_position_from_liquid_surface = _fill_in_defaults(
-      mix_position_from_liquid_surface, [0.0] * n
-    )
-    mix_speed = _fill_in_defaults(
-      mix_speed,
-      default=[
-        hlc.aspiration_mix_flow_rate if hlc is not None else 50.0 for hlc in hamilton_liquid_classes
-      ],
-    )
-    mix_surface_following_distance = _fill_in_defaults(mix_surface_following_distance, [0.0] * n)
-    limit_curve_index = _fill_in_defaults(limit_curve_index, [0] * n)
+    mix_volume = [op.mix.volume if op.mix is not None else 0.0 for op in ops]
+    mix_cycles = [op.mix.repetitions if op.mix is not None else 0 for op in ops]
+    mix_position_from_liquid_surface = fill_in_defaults(mix_position_from_liquid_surface, [0.0] * n)
+    mix_speed = [op.mix.flow_rate if op.mix is not None else 100.0 for op in ops]
+    mix_surface_following_distance = fill_in_defaults(mix_surface_following_distance, [0.0] * n)
+    limit_curve_index = fill_in_defaults(limit_curve_index, [0] * n)
 
-    use_2nd_section_aspiration = _fill_in_defaults(use_2nd_section_aspiration, [False] * n)
-    retract_height_over_2nd_section_to_empty_tip = _fill_in_defaults(
+    use_2nd_section_aspiration = fill_in_defaults(use_2nd_section_aspiration, [False] * n)
+    retract_height_over_2nd_section_to_empty_tip = fill_in_defaults(
       retract_height_over_2nd_section_to_empty_tip, [0.0] * n
     )
-    dispensation_speed_during_emptying_tip = _fill_in_defaults(
+    dispensation_speed_during_emptying_tip = fill_in_defaults(
       dispensation_speed_during_emptying_tip, [50.0] * n
     )
-    dosing_drive_speed_during_2nd_section_search = _fill_in_defaults(
+    dosing_drive_speed_during_2nd_section_search = fill_in_defaults(
       dosing_drive_speed_during_2nd_section_search, [50.0] * n
     )
-    z_drive_speed_during_2nd_section_search = _fill_in_defaults(
+    z_drive_speed_during_2nd_section_search = fill_in_defaults(
       z_drive_speed_during_2nd_section_search, [30.0] * n
     )
-    cup_upper_edge = _fill_in_defaults(cup_upper_edge, [0.0] * n)
-    ratio_liquid_rise_to_tip_deep_in = _fill_in_defaults(ratio_liquid_rise_to_tip_deep_in, [0] * n)
-    immersion_depth_2nd_section = _fill_in_defaults(immersion_depth_2nd_section, [0.0] * n)
+    cup_upper_edge = fill_in_defaults(cup_upper_edge, [0.0] * n)
+
+    # Deprecated params - warn if passed, but don't use them
+    if ratio_liquid_rise_to_tip_deep_in is not None:
+      warnings.warn(
+        "ratio_liquid_rise_to_tip_deep_in is deprecated and will be removed in a future version.",
+        DeprecationWarning,
+        stacklevel=2,
+      )
+    if immersion_depth_2nd_section is not None:
+      warnings.warn(
+        "immersion_depth_2nd_section is deprecated and will be removed in a future version.",
+        DeprecationWarning,
+        stacklevel=2,
+      )
+
+    if probe_liquid_height:
+      if any(op.liquid_height is not None for op in ops):
+        raise ValueError("Cannot use probe_liquid_height when liquid heights are set.")
+
+      liquid_heights = await self.probe_liquid_heights(
+        containers=[op.resource for op in ops],
+        use_channels=use_channels,
+        resource_offsets=[op.offset for op in ops],
+        move_to_z_safety_after=False,
+      )
+
+      # override minimum traversal height because we don't want to move channels up. we are already above the liquid.
+      minimum_traverse_height_at_beginning_of_a_command = 100
+      logger.info(f"Detected liquid heights: {liquid_heights}")
+    else:
+      liquid_heights = [op.liquid_height or 0 for op in ops]
+
+    liquid_surfaces_no_lld = liquid_surface_no_lld or [
+      wb + lh for wb, lh in zip(well_bottoms, liquid_heights)
+    ]
+
+    if auto_surface_following_distance:
+      if any(op.liquid_height is None for op in ops) and not probe_liquid_height:
+        raise ValueError(
+          "To use auto_surface_following_distance all liquid heights must be set or probe_liquid_height must be True."
+        )
+
+      if any(not op.resource.supports_compute_height_volume_functions() for op in ops):
+        raise ValueError(
+          "automatic_surface_following can only be used with containers that support height<->volume functions."
+        )
+
+      current_volumes = [
+        op.resource.compute_volume_from_height(liquid_heights[i]) for i, op in enumerate(ops)
+      ]
+
+      # compute new liquid_height after aspiration
+      liquid_height_after_aspiration = [
+        op.resource.compute_height_from_volume(current_volumes[i] - op.volume)
+        for i, op in enumerate(ops)
+      ]
+
+      # compute new surface_following_distance
+      surface_following_distance = [
+        liquid_heights[i] - liquid_height_after_aspiration[i]
+        for i in range(len(liquid_height_after_aspiration))
+      ]
+    else:
+      surface_following_distance = fill_in_defaults(surface_following_distance, [0.0] * n)
+
+    # check if the surface_following_distance would fall below the minimum height
+    # if lld is enabled, we expect to find liquid above the well bottom so we don't need to raise an error
+    if any(
+      (
+        well_bottoms[i] + liquid_heights[i] - surface_following_distance[i] - minimum_height[i]
+        < -1e-6
+      )
+      and lld_mode[i] == STARBackend.LLDMode.OFF
+      for i in range(n)
+    ):
+      raise ValueError(
+        f"surface_following_distance would result in a height that goes below the minimum_height. "
+        f"Well bottom: {well_bottoms}, liquid height: {liquid_heights}, surface_following_distance: {surface_following_distance}, minimum_height: {minimum_height}"
+      )
 
     try:
       return await self.aspirate_pip(
@@ -1888,8 +2499,6 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
           round(zs * 10) for zs in z_drive_speed_during_2nd_section_search
         ],
         cup_upper_edge=[round(cue * 10) for cue in cup_upper_edge],
-        ratio_liquid_rise_to_tip_deep_in=ratio_liquid_rise_to_tip_deep_in,
-        immersion_depth_2nd_section=[round(id_ * 10) for id_ in immersion_depth_2nd_section],
         minimum_traverse_height_at_beginning_of_a_command=round(
           (minimum_traverse_height_at_beginning_of_a_command or self._channel_traversal_height) * 10
         ),
@@ -1906,13 +2515,11 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
     use_channels: List[int],
     lld_search_height: Optional[List[float]] = None,
     liquid_surface_no_lld: Optional[List[float]] = None,
-    dispensing_mode: Optional[List[int]] = None,
     pull_out_distance_transport_air: Optional[List[float]] = None,
     second_section_height: Optional[List[float]] = None,
     second_section_ratio: Optional[List[float]] = None,
     minimum_height: Optional[List[float]] = None,
     immersion_depth: Optional[List[float]] = None,
-    immersion_depth_direction: Optional[List[int]] = None,
     surface_following_distance: Optional[List[float]] = None,
     cut_off_speed: Optional[List[float]] = None,
     stop_back_volume: Optional[List[float]] = None,
@@ -1923,19 +2530,26 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
     dp_lld_sensitivity: Optional[List[int]] = None,
     swap_speed: Optional[List[float]] = None,
     settling_time: Optional[List[float]] = None,
-    mix_volume: Optional[List[float]] = None,
-    mix_cycles: Optional[List[int]] = None,
     mix_position_from_liquid_surface: Optional[List[float]] = None,
-    mix_speed: Optional[List[float]] = None,
     mix_surface_following_distance: Optional[List[float]] = None,
     limit_curve_index: Optional[List[int]] = None,
     minimum_traverse_height_at_beginning_of_a_command: Optional[int] = None,
     min_z_endpos: Optional[float] = None,
     side_touch_off_distance: float = 0,
-    hamilton_liquid_classes: Optional[List[Optional[HamiltonLiquidClass]]] = None,
     jet: Optional[List[bool]] = None,
     blow_out: Optional[List[bool]] = None,  # "empty" in the VENUS liquid editor
     empty: Optional[List[bool]] = None,  # truly "empty", does not exist in liquid editor, dm4
+    # PLR specific
+    probe_liquid_height: bool = False,
+    auto_surface_following_distance: bool = False,
+    hamilton_liquid_classes: Optional[List[Optional[HamiltonLiquidClass]]] = None,
+    disable_volume_correction: Optional[List[bool]] = None,
+    # remove  in the future
+    immersion_depth_direction: Optional[List[int]] = None,
+    mix_volume: Optional[List[float]] = None,
+    mix_cycles: Optional[List[int]] = None,
+    mix_speed: Optional[List[float]] = None,
+    dispensing_mode: Optional[List[int]] = None,
   ):
     """Dispense liquid from the specified channels.
 
@@ -1946,17 +2560,13 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
     Args:
       ops: The dispense operations to perform.
       use_channels: The channels to use for the dispense operations.
-      dispensing_mode: The dispensing mode to use for each operation.
       lld_search_height: The height to start searching for the liquid level when using LLD.
       liquid_surface_no_lld: Liquid surface at function without LLD.
-      pull_out_distance_transport_air: The distance to pull out the tip for aspirating transport air
-        if LLD is disabled.
-      second_section_height: Unknown.
-      second_section_ratio: Unknown.
+      pull_out_distance_transport_air: The distance to pull out the tip for aspirating transport air if LLD is disabled.
+      second_section_height: The height of the second section.
+      second_section_ratio: The ratio of [the bottom of the container * 10000] / [the height top of the container].
       minimum_height: The minimum height at the end of the dispense.
-      immersion_depth: The distance above or below to liquid level to start dispensing. See the
-        `immersion_depth_direction` parameter.
-      immersion_depth_direction: (0 = go deeper, 1 = go up out of liquid)
+      immersion_depth: The distance above or below to liquid level to start dispensing.
       surface_following_distance: The distance to follow the liquid surface.
       cut_off_speed: Unknown.
       stop_back_volume: Unknown.
@@ -1966,13 +2576,10 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
         position.
       gamma_lld_sensitivity: The gamma LLD sensitivity. (1 = high, 4 = low)
       dp_lld_sensitivity: The dp LLD sensitivity. (1 = high, 4 = low)
-      swap_speed: Swap speed (on leaving liquid) [0.1mm/s]. Must be between 3 and 1600. Default 100.
+      swap_speed: Swap speed (on leaving liquid) [mm/s]. Must be between 3 and 1600. Default 100.
       settling_time: The settling time.
-      mix_volume: The volume to use for mix.
-      mix_cycles: The number of mix cycles.
       mix_position_from_liquid_surface: The height to move above the liquid surface for
         mix.
-      mix_speed: The mix speed.
       mix_surface_following_distance: The distance to follow the liquid surface for mix.
       limit_curve_index: The limit curve to use for the dispense.
       minimum_traverse_height_at_beginning_of_a_command: The minimum height to move to before
@@ -1981,7 +2588,8 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
       side_touch_off_distance: The distance to move to the side from the well for a dispense.
 
       hamilton_liquid_classes: Override the default liquid classes. See
-        pylabrobot/liquid_handling/liquid_classes/hamilton/star.py
+        pylabrobot/liquid_handling/liquid_classes/hamilton/STARBackend.py
+      disable_volume_correction: Whether to disable liquid class volume correction for each operation.
 
       jet: Whether to use jetting for each dispense. Defaults to `False` for all. Used for
         determining the dispense mode. True for dispense mode 0 or 1.
@@ -1991,9 +2599,12 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
       empty: Whether to use "empty" dispense mode for each dispense. Defaults to `False` for all.
         Truly empty the tip, not available in the VENUS liquid editor, but is in the firmware
         documentation. Dispense mode 4.
+
+      probe_liquid_height: PLR-specific parameter. If True, probe the liquid height using cLLD before aspirating to set the liquid_height of every operation instead of using the default 0. Liquid heights must not be set when using this function.
+      auto_surface_following_distance: automatically compute the surface following distance based on the container height<->volume functions. Requires liquid height to be specified or `probe_liquid_height=True`.
     """
 
-    x_positions, y_positions, channels_involved = self._ops_to_fw_positions(ops, use_channels)
+    self.ensure_can_reach_position(use_channels, ops, "dispense")
 
     n = len(ops)
 
@@ -2004,38 +2615,63 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
     if blow_out is None:
       blow_out = [False] * n
 
+    # # # TODO: delete > 2026-01 # # #
+    if mix_volume is not None or mix_cycles is not None or mix_speed is not None:
+      raise NotImplementedError(
+        "Mixing through backend kwargs is deprecated. Use the `mix` parameter of LiquidHandler.dispense instead. "
+        "https://docs.pylabrobot.org/user_guide/00_liquid-handling/mixing.html"
+      )
+
+    if immersion_depth_direction is not None:
+      warnings.warn(
+        "The immersion_depth_direction parameter is deprecated and will be removed in the future. "
+        "Use positive values for immersion_depth to move into the liquid, and negative values to move "
+        "out of the liquid.",
+        DeprecationWarning,
+      )
+
+    if dispensing_mode is not None:
+      warnings.warn(
+        "The dispensing_mode parameter is deprecated and will be removed in the future. "
+        "Use the jet, blow_out and empty parameters instead. "
+        "dispensing_mode currently supersedes the other three parameters if both are provided.",
+        DeprecationWarning,
+      )
+      dispensing_modes = dispensing_mode
+    else:
+      dispensing_modes = [
+        _dispensing_mode_for_op(empty=empty[i], jet=jet[i], blow_out=blow_out[i])
+        for i in range(len(ops))
+      ]
+    # # # delete # # #
+
+    x_positions, y_positions, channels_involved = self._ops_to_fw_positions(ops, use_channels)
+
     if hamilton_liquid_classes is None:
       hamilton_liquid_classes = []
       for i, op in enumerate(ops):
-        liquid = Liquid.WATER  # default to WATER
-        # [-1][0]: get last liquid in tip, [0] is indexing into the tuple
-        if len(op.liquids) > 0 and op.liquids[-1][0] is not None:
-          liquid = op.liquids[-1][0]
-
         hamilton_liquid_classes.append(
           get_star_liquid_class(
             tip_volume=op.tip.maximal_volume,
             is_core=False,
             is_tip=True,
             has_filter=op.tip.has_filter,
-            liquid=liquid,
+            liquid=Liquid.WATER,  # default to WATER
             jet=jet[i],
             blow_out=blow_out[i],
           )
         )
 
     # correct volumes using the liquid class
+    disable_volume_correction = fill_in_defaults(disable_volume_correction, [False] * n)
     volumes = [
-      hlc.compute_corrected_volume(op.volume) if hlc is not None else op.volume
-      for op, hlc in zip(ops, hamilton_liquid_classes)
+      hlc.compute_corrected_volume(op.volume) if hlc is not None and not disabled else op.volume
+      for op, hlc, disabled in zip(ops, hamilton_liquid_classes, disable_volume_correction)
     ]
 
     well_bottoms = [
-      op.resource.get_absolute_location().z + op.offset.z + op.resource.material_z_thickness
+      op.resource.get_location_wrt(self.deck).z + op.offset.z + op.resource.material_z_thickness
       for op in ops
-    ]
-    liquid_surfaces_no_lld = liquid_surface_no_lld or [
-      ls + (op.liquid_height or 0) for ls, op in zip(well_bottoms, ops)
     ]
     if lld_search_height is None:
       lld_search_height = [
@@ -2047,30 +2683,30 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
     else:
       lld_search_height = [wb + sh for wb, sh in zip(well_bottoms, lld_search_height)]
 
-    dispensing_modes = dispensing_mode or [
-      _dispensing_mode_for_op(empty=empty[i], jet=jet[i], blow_out=blow_out[i])
-      for i in range(len(ops))
+    pull_out_distance_transport_air = fill_in_defaults(pull_out_distance_transport_air, [10.0] * n)
+    second_section_height = fill_in_defaults(second_section_height, [3.2] * n)
+    second_section_ratio = fill_in_defaults(second_section_ratio, [618.0] * n)
+    minimum_height = fill_in_defaults(minimum_height, well_bottoms)
+    if immersion_depth is None:
+      immersion_depth = [0.0] * n
+    immersion_depth_direction = immersion_depth_direction or [
+      0 if (id_ >= 0) else 1 for id_ in immersion_depth
     ]
-
-    pull_out_distance_transport_air = _fill_in_defaults(pull_out_distance_transport_air, [10.0] * n)
-    second_section_height = _fill_in_defaults(second_section_height, [3.2] * n)
-    second_section_ratio = _fill_in_defaults(second_section_ratio, [618.0] * n)
-    minimum_height = _fill_in_defaults(minimum_height, well_bottoms)
-    immersion_depth = _fill_in_defaults(immersion_depth, [0.0] * n)
-    immersion_depth_direction = _fill_in_defaults(immersion_depth_direction, [0] * n)
-    surface_following_distance = _fill_in_defaults(surface_following_distance, [0.0] * n)
+    immersion_depth = [
+      im * (-1 if immersion_depth_direction[i] else 1) for i, im in enumerate(immersion_depth)
+    ]
     flow_rates = [
       op.flow_rate or (hlc.dispense_flow_rate if hlc is not None else 120.0)
       for op, hlc in zip(ops, hamilton_liquid_classes)
     ]
-    cut_off_speed = _fill_in_defaults(cut_off_speed, [5.0] * n)
-    stop_back_volume = _fill_in_defaults(
+    cut_off_speed = fill_in_defaults(cut_off_speed, [5.0] * n)
+    stop_back_volume = fill_in_defaults(
       stop_back_volume,
       default=[
         hlc.dispense_stop_back_volume if hlc is not None else 0.0 for hlc in hamilton_liquid_classes
       ],
     )
-    transport_air_volume = _fill_in_defaults(
+    transport_air_volume = fill_in_defaults(
       transport_air_volume,
       default=[
         hlc.dispense_air_transport_volume if hlc is not None else 0.0
@@ -2081,37 +2717,80 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
       (op.blow_out_air_volume or (hlc.dispense_blow_out_volume if hlc is not None else 0.0))
       for op, hlc in zip(ops, hamilton_liquid_classes)
     ]
-    lld_mode = _fill_in_defaults(lld_mode, [self.__class__.LLDMode.OFF] * n)
-    dispense_position_above_z_touch_off = _fill_in_defaults(
+    lld_mode = fill_in_defaults(lld_mode, [self.__class__.LLDMode.OFF] * n)
+    dispense_position_above_z_touch_off = fill_in_defaults(
       dispense_position_above_z_touch_off, default=[0] * n
     )
-    gamma_lld_sensitivity = _fill_in_defaults(gamma_lld_sensitivity, [1] * n)
-    dp_lld_sensitivity = _fill_in_defaults(dp_lld_sensitivity, [1] * n)
-    swap_speed = _fill_in_defaults(
+    gamma_lld_sensitivity = fill_in_defaults(gamma_lld_sensitivity, [1] * n)
+    dp_lld_sensitivity = fill_in_defaults(dp_lld_sensitivity, [1] * n)
+    swap_speed = fill_in_defaults(
       swap_speed,
       default=[
         hlc.dispense_swap_speed if hlc is not None else 10.0 for hlc in hamilton_liquid_classes
       ],
     )
-    settling_time = _fill_in_defaults(
+    settling_time = fill_in_defaults(
       settling_time,
       default=[
         hlc.dispense_settling_time if hlc is not None else 0.0 for hlc in hamilton_liquid_classes
       ],
     )
-    mix_volume = _fill_in_defaults(mix_volume, [0.0] * n)
-    mix_cycles = _fill_in_defaults(mix_cycles, [0] * n)
-    mix_position_from_liquid_surface = _fill_in_defaults(
-      mix_position_from_liquid_surface, [0.0] * n
-    )
-    mix_speed = _fill_in_defaults(
-      mix_speed,
-      default=[
-        hlc.dispense_mix_flow_rate if hlc is not None else 50.0 for hlc in hamilton_liquid_classes
-      ],
-    )
-    mix_surface_following_distance = _fill_in_defaults(mix_surface_following_distance, [0.0] * n)
-    limit_curve_index = _fill_in_defaults(limit_curve_index, [0] * n)
+    mix_volume = [op.mix.volume if op.mix is not None else 0.0 for op in ops]
+    mix_cycles = [op.mix.repetitions if op.mix is not None else 0 for op in ops]
+    mix_position_from_liquid_surface = fill_in_defaults(mix_position_from_liquid_surface, [0.0] * n)
+    mix_speed = [op.mix.flow_rate if op.mix is not None else 1.0 for op in ops]
+    mix_surface_following_distance = fill_in_defaults(mix_surface_following_distance, [0.0] * n)
+    limit_curve_index = fill_in_defaults(limit_curve_index, [0] * n)
+
+    if probe_liquid_height:
+      if any(op.liquid_height is not None for op in ops):
+        raise ValueError("Cannot use probe_liquid_height when liquid heights are set.")
+
+      liquid_heights = await self.probe_liquid_heights(
+        containers=[op.resource for op in ops],
+        use_channels=use_channels,
+        resource_offsets=[op.offset for op in ops],
+        move_to_z_safety_after=False,
+      )
+
+      # override minimum traversal height because we don't want to move channels up. we are already above the liquid.
+      minimum_traverse_height_at_beginning_of_a_command = 100
+      logger.info(f"Detected liquid heights: {liquid_heights}")
+    else:
+      liquid_heights = [op.liquid_height or 0 for op in ops]
+
+    if auto_surface_following_distance:
+      if any(op.liquid_height is None for op in ops) and not probe_liquid_height:
+        raise ValueError(
+          "To use auto_surface_following_distance all liquid heights must be set or probe_liquid_height must be True."
+        )
+
+      if any(not op.resource.supports_compute_height_volume_functions() for op in ops):
+        raise ValueError(
+          "automatic_surface_following can only be used with containers that support height<->volume functions."
+        )
+
+      current_volumes = [
+        op.resource.compute_volume_from_height(liquid_heights[i]) for i, op in enumerate(ops)
+      ]
+
+      # compute new liquid_height after aspiration
+      liquid_height_after_aspiration = [
+        op.resource.compute_height_from_volume(current_volumes[i] + op.volume)
+        for i, op in enumerate(ops)
+      ]
+
+      # compute new surface_following_distance
+      surface_following_distance = [
+        liquid_height_after_aspiration[i] - liquid_heights[i]
+        for i in range(len(liquid_height_after_aspiration))
+      ]
+    else:
+      surface_following_distance = fill_in_defaults(surface_following_distance, [0.0] * n)
+
+    liquid_surfaces_no_lld = liquid_surface_no_lld or [
+      wb + lh for wb, lh in zip(well_bottoms, liquid_heights)
+    ]
 
     try:
       ret = await self.dispense_pip(
@@ -2126,7 +2805,7 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
         second_section_height=[round(sh * 10) for sh in second_section_height],
         second_section_ratio=[round(sr * 10) for sr in second_section_ratio],
         minimum_height=[round(mh * 10) for mh in minimum_height],
-        immersion_depth=[round(id_ * 10) for id_ in immersion_depth],  # [0, 0]
+        immersion_depth=[round(id_ * 10) for id_ in immersion_depth],
         immersion_depth_direction=immersion_depth_direction,
         surface_following_distance=[round(sfd * 10) for sfd in surface_following_distance],
         dispense_speed=[round(fr * 10) for fr in flow_rates],
@@ -2156,7 +2835,7 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
           (minimum_traverse_height_at_beginning_of_a_command or self._channel_traversal_height) * 10
         ),
         min_z_endpos=round((min_z_endpos or self._channel_traversal_height) * 10),
-        side_touch_off_distance=side_touch_off_distance,
+        side_touch_off_distance=round(side_touch_off_distance * 10),
       )
     except STARFirmwareError as e:
       if plr_e := convert_star_firmware_error_to_plr_error(e):
@@ -2168,63 +2847,139 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
   async def pick_up_tips96(
     self,
     pickup: PickupTipRack,
-    tip_pickup_method: int = 0,
-    z_deposit_position: float = 216.4,
+    tip_pickup_method: Literal["from_rack", "from_waste", "full_blowout"] = "from_rack",
     minimum_height_command_end: Optional[float] = None,
     minimum_traverse_height_at_beginning_of_a_command: Optional[float] = None,
+    experimental_alignment_tipspot_identifier: str = "A1",
   ):
-    """Pick up tips using the 96 head."""
+    """Pick up tips using the 96 head.
+
+    `tip_pickup_method` can be one of the following:
+        - "from_rack": standard tip pickup from a tip rack. this moves the plunger all the way down before mounting tips.
+        - "from_waste":
+            1. it actually moves the plunger all the way up
+            2. mounts tips
+            3. moves up like 10mm
+            4. moves plunger all the way down
+            5. moves to traversal height (tips out of rack)
+        - "full_blowout":
+            1. it actually moves the plunger all the way up
+            2. mounts tips
+            3. moves to traversal height (tips out of rack)
+
+    Args:
+      pickup: The standard `PickupTipRack` operation.
+      tip_pickup_method: The method to use for picking up tips. One of "from_rack", "from_waste", "full_blowout".
+      minimum_height_command_end: The minimum height to move to at the end of the command.
+      minimum_traverse_height_at_beginning_of_a_command: The minimum height to move to at the beginning of the command.
+      experimental_alignment_tipspot_identifier: The tipspot to use for alignment with head's A1 channel. Defaults to "tipspot A1".  allowed range is A1 to H12.
+    """
+
+    if isinstance(tip_pickup_method, int):
+      warnings.warn(
+        "tip_pickup_method as int is deprecated and will be removed in the future. Use string literals instead.",
+        DeprecationWarning,
+      )
+      tip_pickup_method = {0: "from_rack", 1: "from_waste", 2: "full_blowout"}[tip_pickup_method]
+
+    if tip_pickup_method not in {"from_rack", "from_waste", "full_blowout"}:
+      raise ValueError(f"Invalid tip_pickup_method: '{tip_pickup_method}'.")
+
     assert self.core96_head_installed, "96 head must be installed"
-    tip_spot_a1 = pickup.resource.get_item("A1")
-    prototypical_tip = None
-    for tip_spot in pickup.resource.get_all_items():
-      if tip_spot.has_tip():
-        prototypical_tip = tip_spot.get_tip()
-        break
+
+    prototypical_tip = next((tip for tip in pickup.tips if tip is not None), None)
     if prototypical_tip is None:
       raise ValueError("No tips found in the tip rack.")
-    assert isinstance(prototypical_tip, HamiltonTip), "Tip type must be HamiltonTip."
-    ttti = await self.get_or_assign_tip_type_index(prototypical_tip)
-    position = tip_spot_a1.get_absolute_location() + tip_spot_a1.center() + pickup.offset
-    z_deposit_position += round(pickup.offset.z * 10)
+    if not isinstance(prototypical_tip, HamiltonTip):
+      raise TypeError("Tip type must be HamiltonTip.")
 
-    x_direction = 0 if position.x > 0 else 1
-    return await self.pick_up_tips_core96(
-      x_position=abs(round(position.x * 10)),
-      x_direction=x_direction,
-      y_position=round(position.y * 10),
-      tip_type_idx=ttti,
-      tip_pickup_method=tip_pickup_method,
-      z_deposit_position=round(z_deposit_position * 10),
-      minimum_traverse_height_at_beginning_of_a_command=round(
-        (minimum_traverse_height_at_beginning_of_a_command or self._channel_traversal_height) * 10
-      ),
-      minimum_height_command_end=round(
-        (minimum_height_command_end or self._channel_traversal_height) * 10
-      ),
+    ttti = await self.get_or_assign_tip_type_index(prototypical_tip)
+
+    tip_length = prototypical_tip.total_tip_length
+    fitting_depth = prototypical_tip.fitting_depth
+    tip_engage_height_from_tipspot = tip_length - fitting_depth
+
+    # Adjust tip engage height based on tip size
+    if prototypical_tip.tip_size == TipSize.LOW_VOLUME:
+      tip_engage_height_from_tipspot += 2
+    elif prototypical_tip.tip_size != TipSize.STANDARD_VOLUME:
+      tip_engage_height_from_tipspot -= 2
+
+    # Compute pickup Z
+    alignment_tipspot = pickup.resource.get_item(experimental_alignment_tipspot_identifier)
+    tip_spot_z = alignment_tipspot.get_location_wrt(self.deck).z + pickup.offset.z
+    z_pickup_position = tip_spot_z + tip_engage_height_from_tipspot
+
+    # Compute full position (used for x/y)
+    pickup_position = (
+      alignment_tipspot.get_location_wrt(self.deck) + alignment_tipspot.center() + pickup.offset
     )
+    pickup_position.z = round(z_pickup_position, 2)
+
+    self._check_96_position_legal(pickup_position, skip_z=True)
+
+    if tip_pickup_method == "from_rack":
+      # the STAR will not automatically move the dispensing drive down if it is still up
+      # so we need to move it down here
+      # see https://github.com/PyLabRobot/pylabrobot/pull/835
+      lowest_dispensing_drive_height_no_tips = 218.19
+      await self.head96_dispensing_drive_move_to_position(lowest_dispensing_drive_height_no_tips)
+
+    try:
+      await self.pick_up_tips_core96(
+        x_position=abs(round(pickup_position.x * 10)),
+        x_direction=0 if pickup_position.x >= 0 else 1,
+        y_position=round(pickup_position.y * 10),
+        tip_type_idx=ttti,
+        tip_pickup_method={
+          "from_rack": 0,
+          "from_waste": 1,
+          "full_blowout": 2,
+        }[tip_pickup_method],
+        z_deposit_position=round(pickup_position.z * 10),
+        minimum_traverse_height_at_beginning_of_a_command=round(
+          (minimum_traverse_height_at_beginning_of_a_command or self._channel_traversal_height) * 10
+        ),
+        minimum_height_command_end=round(
+          (minimum_height_command_end or self._channel_traversal_height) * 10
+        ),
+      )
+    except STARFirmwareError as e:
+      if plr_e := convert_star_firmware_error_to_plr_error(e):
+        raise plr_e from e
+      raise e
 
   async def drop_tips96(
     self,
     drop: DropTipRack,
-    z_deposit_position: float = 216.4,
     minimum_height_command_end: Optional[float] = None,
     minimum_traverse_height_at_beginning_of_a_command: Optional[float] = None,
+    experimental_alignment_tipspot_identifier: str = "A1",
   ):
     """Drop tips from the 96 head."""
     assert self.core96_head_installed, "96 head must be installed"
+
     if isinstance(drop.resource, TipRack):
-      tip_spot_a1 = drop.resource.get_item("A1")
-      position = tip_spot_a1.get_absolute_location() + tip_spot_a1.center() + drop.offset
+      tip_spot_a1 = drop.resource.get_item(experimental_alignment_tipspot_identifier)
+      position = tip_spot_a1.get_location_wrt(self.deck) + tip_spot_a1.center() + drop.offset
+      tip_rack = tip_spot_a1.parent
+      assert tip_rack is not None
+      position.z = tip_rack.get_location_wrt(self.deck).z + 1.45
+      # This should be the case for all normal hamilton tip carriers + racks
+      # In the future, we might want to make this more flexible
+      assert abs(position.z - 216.4) < 1e-6, f"z position must be 216.4, got {position.z}"
     else:
       position = self._position_96_head_in_resource(drop.resource) + drop.offset
 
-    x_direction = 0 if position.x > 0 else 1
+    self._check_96_position_legal(position, skip_z=True)
+
+    x_direction = 0 if position.x >= 0 else 1
+
     return await self.discard_tips_core96(
       x_position=abs(round(position.x * 10)),
       x_direction=x_direction,
       y_position=round(position.y * 10),
-      z_deposit_position=round(z_deposit_position * 10),
+      z_deposit_position=round(position.z * 10),
       minimum_traverse_height_at_beginning_of_a_command=round(
         (minimum_traverse_height_at_beginning_of_a_command or self._channel_traversal_height) * 10
       ),
@@ -2239,30 +2994,39 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
     jet: bool = False,
     blow_out: bool = False,
     use_lld: bool = False,
-    liquid_height: float = 0,
-    air_transport_retract_dist: float = 10,
+    pull_out_distance_transport_air: float = 10,
     hlc: Optional[HamiltonLiquidClass] = None,
     aspiration_type: int = 0,
     minimum_traverse_height_at_beginning_of_a_command: Optional[float] = None,
-    minimal_end_height: Optional[float] = None,
+    min_z_endpos: Optional[float] = None,
     lld_search_height: float = 199.9,
-    maximum_immersion_depth: Optional[float] = None,
-    tube_2nd_section_height_measured_from_zm: float = 3.2,
-    tube_2nd_section_ratio: float = 618.0,
+    minimum_height: Optional[float] = None,
+    second_section_height: float = 3.2,
+    second_section_ratio: float = 618.0,
     immersion_depth: float = 0,
-    immersion_depth_direction: int = 0,
-    liquid_surface_sink_distance_at_the_end_of_aspiration: float = 0,
+    surface_following_distance: float = 0,
     transport_air_volume: float = 5.0,
     pre_wetting_volume: float = 5.0,
     gamma_lld_sensitivity: int = 1,
     swap_speed: float = 2.0,
     settling_time: float = 1.0,
+    mix_position_from_liquid_surface: float = 0,
+    mix_surface_following_distance: float = 0,
+    limit_curve_index: int = 0,
+    disable_volume_correction: bool = False,
+    # Deprecated parameters, to be removed in future versions
+    # rm: >2026-01
+    liquid_surface_sink_distance_at_the_end_of_aspiration: float = 0,
+    minimal_end_height: Optional[float] = None,
+    air_transport_retract_dist: Optional[float] = None,
+    maximum_immersion_depth: Optional[float] = None,
+    surface_following_distance_during_mix: float = 0,
+    tube_2nd_section_height_measured_from_zm: float = 3.2,
+    tube_2nd_section_ratio: float = 618.0,
+    immersion_depth_direction: Optional[int] = None,
     mix_volume: float = 0,
     mix_cycles: int = 0,
-    mix_position_from_liquid_surface: float = 0,
-    surface_following_distance_during_mix: float = 0,
-    speed_of_mix: float = 120.0,
-    limit_curve_index: int = 0,
+    speed_of_mix: float = 0.0,
   ):
     """Aspirate using the Core96 head.
 
@@ -2277,46 +3041,128 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
         automatically.
 
       use_lld: If True, use gamma liquid level detection. If False, use liquid height.
-      liquid_height: The height of the liquid above the bottom of the well, in millimeters.
-      air_transport_retract_dist: The distance to retract after aspirating, in millimeters.
+      pull_out_distance_transport_air: The distance to retract after aspirating, in millimeters.
 
-      aspiration_type: The type of aspiration to perform. (0 = simple; 1 = sequence; 2 = cup emptied
-        )
+      aspiration_type: The type of aspiration to perform. (0 = simple; 1 = sequence; 2 = cup emptied)
       minimum_traverse_height_at_beginning_of_a_command: The minimum height to move to before
         starting the command.
-      minimal_end_height: The minimum height to move to after the command.
+      min_z_endpos: The minimum height to move to after the command.
       lld_search_height: The height to search for the liquid level.
-      maximum_immersion_depth: The maximum immersion depth.
-      tube_2nd_section_height_measured_from_zm: Unknown.
-      tube_2nd_section_ratio: Unknown.
-      immersion_depth: The immersion depth above or below the liquid level. See
-       `immersion_depth_direction`.
-      immersion_depth_direction: The direction of the immersion depth. (0 = deeper, 1 = out of
-        liquid)
+      minimum_height: Minimum height (maximum immersion depth)
+      second_section_height: Height of the second section.
+      second_section_ratio: Ratio of [the diameter of the bottom * 10000] / [the diameter of the top]
+      immersion_depth: The immersion depth above or below the liquid level.
+      surface_following_distance: The distance to follow the liquid surface when aspirating.
       transport_air_volume: The volume of air to aspirate after the liquid.
       pre_wetting_volume: The volume of liquid to use for pre-wetting.
       gamma_lld_sensitivity: The sensitivity of the gamma liquid level detection.
       swap_speed: Swap speed (on leaving liquid) [1mm/s]. Must be between 0.3 and 160. Default 2.
       settling_time: The time to wait after aspirating.
-      mix_volume: The volume of liquid to aspirate for mix.
-      mix_cycles: The number of cycles to perform for mix.
-      mix_position_from_liquid_surface: The position of the mix from the
-        liquid surface.
-      surface_following_distance_during_mix: The distance to follow the liquid surface
-        during mix.
-      speed_of_mix: The speed of mix.
+      mix_position_from_liquid_surface: The position of the mix from the liquid surface.
+      mix_surface_following_distance: The distance to follow the liquid surface during mix.
       limit_curve_index: The index of the limit curve to use.
+      disable_volume_correction: Whether to disable liquid class volume correction.
     """
+
+    # # # TODO: delete > 2026-01 # # #
+    if mix_volume != 0 or mix_cycles != 0 or speed_of_mix != 0:
+      raise NotImplementedError(
+        "Mixing through backend kwargs is deprecated. Use the `mix` parameter of LiquidHandler.aspirate96 instead. "
+        "https://docs.pylabrobot.org/user_guide/00_liquid-handling/mixing.html"
+      )
+
+    if immersion_depth_direction is not None:
+      warnings.warn(
+        "The immersion_depth_direction parameter is deprecated and will be removed in the future. "
+        "Use positive values for immersion_depth to move into the liquid, and negative values to move "
+        "out of the liquid.",
+        DeprecationWarning,
+      )
+
+    if liquid_surface_sink_distance_at_the_end_of_aspiration != 0:
+      surface_following_distance = liquid_surface_sink_distance_at_the_end_of_aspiration
+      warnings.warn(
+        "The liquid_surface_sink_distance_at_the_end_of_aspiration parameter is deprecated and will be removed in the future. "
+        "Use the Hamilton-standard surface_following_distance parameter instead.\n"
+        "liquid_surface_sink_distance_at_the_end_of_aspiration currently superseding surface_following_distance.",
+        DeprecationWarning,
+      )
+
+    if minimal_end_height is not None:
+      min_z_endpos = minimal_end_height
+      warnings.warn(
+        "The minimal_end_height parameter is deprecated and will be removed in the future. "
+        "Use the Hamilton-standard min_z_endpos parameter instead.\n"
+        "min_z_endpos currently superseding minimal_end_height.",
+        DeprecationWarning,
+      )
+
+    if air_transport_retract_dist is not None:
+      pull_out_distance_transport_air = air_transport_retract_dist
+      warnings.warn(
+        "The air_transport_retract_dist parameter is deprecated and will be removed in the future. "
+        "Use the Hamilton-standard pull_out_distance_transport_air parameter instead.\n"
+        "pull_out_distance_transport_air currently superseding air_transport_retract_dist.",
+        DeprecationWarning,
+      )
+
+    if maximum_immersion_depth is not None:
+      minimum_height = maximum_immersion_depth
+      warnings.warn(
+        "The maximum_immersion_depth parameter is deprecated and will be removed in the future. "
+        "Use the Hamilton-standard minimum_height parameter instead.\n"
+        "minimum_height currently superseding maximum_immersion_depth.",
+        DeprecationWarning,
+      )
+
+    if surface_following_distance_during_mix != 0:
+      mix_surface_following_distance = surface_following_distance_during_mix
+      warnings.warn(
+        "The surface_following_distance_during_mix parameter is deprecated and will be removed in the future. "
+        "Use the Hamilton-standard mix_surface_following_distance parameter instead.\n"
+        "mix_surface_following_distance currently superseding surface_following_distance_during_mix.",
+        DeprecationWarning,
+      )
+
+    if tube_2nd_section_height_measured_from_zm != 3.2:
+      second_section_height = tube_2nd_section_height_measured_from_zm
+      warnings.warn(
+        "The tube_2nd_section_height_measured_from_zm parameter is deprecated and will be removed in the future. "
+        "Use the Hamilton-standard second_section_height parameter instead.\n"
+        "second_section_height_measured_from_zm currently superseding second_section_height.",
+        DeprecationWarning,
+      )
+
+    if tube_2nd_section_ratio != 618.0:
+      second_section_ratio = tube_2nd_section_ratio
+      warnings.warn(
+        "The tube_2nd_section_ratio parameter is deprecated and will be removed in the future. "
+        "Use the Hamilton-standard second_section_ratio parameter instead.\n"
+        "second_section_ratio currently superseding tube_2nd_section_ratio.",
+        DeprecationWarning,
+      )
+    # # # delete # # #
 
     assert self.core96_head_installed, "96 head must be installed"
 
     # get the first well and tip as representatives
     if isinstance(aspiration, MultiHeadAspirationPlate):
-      top_left_well = aspiration.wells[0]
+      plate = aspiration.wells[0].parent
+      assert isinstance(plate, Plate), "MultiHeadAspirationPlate well parent must be a Plate"
+      rot = plate.get_absolute_rotation()
+      if rot.x % 360 != 0 or rot.y % 360 != 0:
+        raise ValueError("Plate rotation around x or y is not supported for 96 head operations")
+      if rot.z % 360 == 180:
+        ref_well = plate.get_well("H12")
+      elif rot.z % 360 == 0:
+        ref_well = plate.get_well("A1")
+      else:
+        raise ValueError("96 head only supports plate rotations of 0 or 180 degrees around z")
+
       position = (
-        top_left_well.get_absolute_location()
-        + top_left_well.center()
-        + Coordinate(z=top_left_well.material_z_thickness)
+        ref_well.get_location_wrt(self.deck)
+        + ref_well.center()
+        + Coordinate(z=ref_well.material_z_thickness)
         + aspiration.offset
       )
     else:
@@ -2325,34 +3171,31 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
       x_position = (aspiration.container.get_absolute_size_x() - x_width) / 2
       y_position = (aspiration.container.get_absolute_size_y() - y_width) / 2 + y_width
       position = (
-        aspiration.container.get_absolute_location(z="cavity_bottom")
+        aspiration.container.get_location_wrt(self.deck, z="cavity_bottom")
         + Coordinate(x=x_position, y=y_position)
         + aspiration.offset
       )
+    self._check_96_position_legal(position, skip_z=True)
 
-    tip = aspiration.tips[0]
+    tip = next(tip for tip in aspiration.tips if tip is not None)
 
-    liquid_height = position.z + liquid_height
+    liquid_height = position.z + (aspiration.liquid_height or 0)
 
-    liquid_to_be_aspirated = Liquid.WATER
-    if len(aspiration.liquids[0]) > 0 and aspiration.liquids[0][0][0] is not None:
-      # [channel][liquid][PyLabRobot.resources.liquid.Liquid]
-      liquid_to_be_aspirated = aspiration.liquids[0][0][0]
     hlc = hlc or get_star_liquid_class(
       tip_volume=tip.maximal_volume,
       is_core=True,
       is_tip=True,
       has_filter=tip.has_filter,
       # get last liquid in pipette, first to be dispensed
-      liquid=liquid_to_be_aspirated,
+      liquid=Liquid.WATER,  # default to WATER
       jet=jet,
       blow_out=blow_out,  # see comment in method docstring
     )
 
-    if hlc is not None:
-      volume = hlc.compute_corrected_volume(aspiration.volume)
-    else:
+    if disable_volume_correction or hlc is None:
       volume = aspiration.volume
+    else:  # hlc is not None and not disable_volume_correction
+      volume = hlc.compute_corrected_volume(aspiration.volume)
 
     # Get better default values from the HLC if available
     transport_air_volume = transport_air_volume or (
@@ -2364,45 +3207,26 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
     flow_rate = aspiration.flow_rate or (hlc.aspiration_flow_rate if hlc is not None else 250)
     swap_speed = swap_speed or (hlc.aspiration_swap_speed if hlc is not None else 100)
     settling_time = settling_time or (hlc.aspiration_settling_time if hlc is not None else 0.5)
-    speed_of_mix = speed_of_mix or (hlc.aspiration_mix_flow_rate if hlc is not None else 10.0)
 
-    channel_pattern = [True] * 12 * 8
-
-    # Was this ever true? Just copied it over from pyhamilton. Could have something to do with
-    # the liquid classes and whether blow_out mode is enabled.
-    # # Unfortunately, `blow_out_air_volume` does not work correctly, so instead we aspirate air
-    # # manually.
-    # if blow_out_air_volume is not None and blow_out_air_volume > 0:
-    #   await self.aspirate_core_96(
-    #     x_position=int(position.x * 10),
-    #     y_positions=int(position.y * 10),
-    #     lld_mode=0,
-    #     liquid_surface_at_function_without_lld=int((liquid_height + 30) * 10),
-    #     aspiration_volumes=int(blow_out_air_volume * 10)
-    #   )
-
+    x_direction = 0 if position.x >= 0 else 1
     return await self.aspirate_core_96(
-      x_position=round(position.x * 10),
-      x_direction=0,
+      x_position=abs(round(position.x * 10)),
+      x_direction=x_direction,
       y_positions=round(position.y * 10),
       aspiration_type=aspiration_type,
       minimum_traverse_height_at_beginning_of_a_command=round(
         (minimum_traverse_height_at_beginning_of_a_command or self._channel_traversal_height) * 10
       ),
-      minimal_end_height=round((minimal_end_height or self._channel_traversal_height) * 10),
+      min_z_endpos=round((min_z_endpos or self._channel_traversal_height) * 10),
       lld_search_height=round(lld_search_height * 10),
-      liquid_surface_at_function_without_lld=round(liquid_height * 10),
-      pull_out_distance_to_take_transport_air_in_function_without_lld=round(
-        air_transport_retract_dist * 10
-      ),
-      maximum_immersion_depth=round((maximum_immersion_depth or position.z) * 10),
-      tube_2nd_section_height_measured_from_zm=round(tube_2nd_section_height_measured_from_zm * 10),
-      tube_2nd_section_ratio=round(tube_2nd_section_ratio * 10),
+      liquid_surface_no_lld=round(liquid_height * 10),
+      pull_out_distance_transport_air=round(pull_out_distance_transport_air * 10),
+      minimum_height=round((minimum_height or position.z) * 10),
+      second_section_height=round(second_section_height * 10),
+      second_section_ratio=round(second_section_ratio * 10),
       immersion_depth=round(immersion_depth * 10),
-      immersion_depth_direction=immersion_depth_direction,
-      liquid_surface_sink_distance_at_the_end_of_aspiration=round(
-        liquid_surface_sink_distance_at_the_end_of_aspiration * 10
-      ),
+      immersion_depth_direction=immersion_depth_direction or (0 if (immersion_depth >= 0) else 1),
+      surface_following_distance=round(surface_following_distance * 10),
       aspiration_volumes=round(volume * 10),
       aspiration_speed=round(flow_rate * 10),
       transport_air_volume=round(transport_air_volume * 10),
@@ -2412,12 +3236,12 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
       gamma_lld_sensitivity=gamma_lld_sensitivity,
       swap_speed=round(swap_speed * 10),
       settling_time=round(settling_time * 10),
-      mix_volume=round(mix_volume * 10),
-      mix_cycles=mix_cycles,
+      mix_volume=round(aspiration.mix.volume * 10) if aspiration.mix is not None else 0,
+      mix_cycles=aspiration.mix.repetitions if aspiration.mix is not None else 0,
       mix_position_from_liquid_surface=round(mix_position_from_liquid_surface * 10),
-      surface_following_distance_during_mix=round(surface_following_distance_during_mix * 10),
-      speed_of_mix=round(speed_of_mix * 10),
-      channel_pattern=channel_pattern,
+      mix_surface_following_distance=round(mix_surface_following_distance * 10),
+      speed_of_mix=round(aspiration.mix.flow_rate * 10) if aspiration.mix is not None else 1200,
+      channel_pattern=[True] * 12 * 8,
       limit_curve_index=limit_curve_index,
       tadm_algorithm=False,
       recording_mode=0,
@@ -2430,78 +3254,191 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
     empty: bool = False,
     blow_out: bool = False,
     hlc: Optional[HamiltonLiquidClass] = None,
-    liquid_height: float = 0,
-    dispense_mode: Optional[int] = None,
-    air_transport_retract_dist=10,
+    pull_out_distance_transport_air=10,
     use_lld: bool = False,
     minimum_traverse_height_at_beginning_of_a_command: Optional[float] = None,
-    minimal_end_height: Optional[float] = None,
+    min_z_endpos: Optional[float] = None,
     lld_search_height: float = 199.9,
-    maximum_immersion_depth: Optional[float] = None,
-    tube_2nd_section_height_measured_from_zm: float = 3.2,
-    tube_2nd_section_ratio: float = 618.0,
+    minimum_height: Optional[float] = None,
+    second_section_height: float = 3.2,
+    second_section_ratio: float = 618.0,
     immersion_depth: float = 0,
-    immersion_depth_direction: int = 0,
-    liquid_surface_sink_distance_at_the_end_of_dispense: float = 0,
+    surface_following_distance: float = 0,
     transport_air_volume: float = 5.0,
     gamma_lld_sensitivity: int = 1,
     swap_speed: float = 2.0,
     settling_time: float = 0,
-    mixing_volume: float = 0,
-    mixing_cycles: int = 0,
-    mixing_position_from_liquid_surface: float = 0,
-    surface_following_distance_during_mixing: float = 0,
-    speed_of_mixing: float = 120.0,
+    mix_position_from_liquid_surface: float = 0,
+    mix_surface_following_distance: float = 0,
     limit_curve_index: int = 0,
     cut_off_speed: float = 5.0,
     stop_back_volume: float = 0,
+    disable_volume_correction: bool = False,
+    # Deprecated parameters, to be removed in future versions
+    # rm: >2026-01
+    liquid_surface_sink_distance_at_the_end_of_dispense: float = 0,  # surface_following_distance!
+    maximum_immersion_depth: Optional[float] = None,
+    minimal_end_height: Optional[float] = None,
+    mixing_position_from_liquid_surface: float = 0,
+    surface_following_distance_during_mixing: float = 0,
+    air_transport_retract_dist=10,
+    tube_2nd_section_ratio: float = 618.0,
+    tube_2nd_section_height_measured_from_zm: float = 3.2,
+    immersion_depth_direction: Optional[int] = None,
+    mixing_volume: float = 0,
+    mixing_cycles: int = 0,
+    speed_of_mixing: float = 0.0,
+    dispense_mode: Optional[int] = None,
   ):
     """Dispense using the Core96 head.
 
     Args:
       dispense: The Dispense command to execute.
       jet: Whether to use jet dispense mode.
+      empty: Whether to use empty dispense mode.
       blow_out: Whether to blow out after dispensing.
-      liquid_height: The height of the liquid in the well, in mm. Used if LLD is not used.
-      dispense_mode: The dispense mode to use. 0 = Partial volume in jet mode 1 = Blow out in jet
-        mode 2 = Partial volume at surface 3 = Blow out at surface 4 = Empty tip at fix position.
-        If `None`, the mode will be determined based on the `jet`, `empty`, and `blow_out`
-      air_transport_retract_dist: The distance to retract after dispensing, in mm.
+      pull_out_distance_transport_air: The distance to retract after dispensing, in mm.
       use_lld: Whether to use gamma LLD.
 
       minimum_traverse_height_at_beginning_of_a_command: Minimum traverse height at beginning of a
         command, in mm.
-      minimal_end_height: Minimal end height, in mm.
+      min_z_endpos: Minimal end height, in mm.
       lld_search_height: LLD search height, in mm.
-      maximum_immersion_depth: Maximum immersion depth, in mm. Equals Minimum height during command.
-      tube_2nd_section_height_measured_from_zm: Unknown.
-      tube_2nd_section_ratio: Unknown.
-      immersion_depth: Immersion depth, in mm. See `immersion_depth_direction`.
-      immersion_depth_direction: Immersion depth direction. 0 = go deeper, 1 = go up out of liquid.
-      liquid_surface_sink_distance_at_the_end_of_dispense: Unknown.
+      minimum_height: Maximum immersion depth, in mm. Equals Minimum height during command.
+      second_section_height: Height of the second section, in mm.
+      second_section_ratio: Ratio of [the diameter of the bottom * 10000] / [the diameter of the top].
+      immersion_depth: Immersion depth, in mm.
+      surface_following_distance: Surface following distance, in mm. Default 0.
       transport_air_volume: Transport air volume, to dispense before aspiration.
       gamma_lld_sensitivity: Gamma LLD sensitivity.
       swap_speed: Swap speed (on leaving liquid) [mm/s]. Must be between 0.3 and 160. Default 10.
       settling_time: Settling time, in seconds.
-      mixing_volume: Mixing volume, in ul.
-      mixing_cycles: Mixing cycles.
-      mixing_position_from_liquid_surface: Mixing position from liquid surface, in mm.
-      surface_following_distance_during_mixing: Surface following distance during mixing, in mm.
-      speed_of_mixing: Speed of mixing, in ul/s.
+      mix_position_from_liquid_surface: Mixing position from liquid surface, in mm.
+      mix_surface_following_distance: Surface following distance during mixing, in mm.
       limit_curve_index: Limit curve index.
       cut_off_speed: Unknown.
       stop_back_volume: Unknown.
+      disable_volume_correction: Whether to disable liquid class volume correction.
     """
+
+    # # # TODO: delete > 2026-01 # # #
+    if mixing_volume != 0 or mixing_cycles != 0 or speed_of_mixing != 0:
+      raise NotImplementedError(
+        "Mixing through backend kwargs is deprecated. Use the `mix` parameter of LiquidHandler.dispense instead. "
+        "https://docs.pylabrobot.org/user_guide/00_liquid-handling/mixing.html"
+      )
+
+    if immersion_depth_direction is not None:
+      warnings.warn(
+        "The immersion_depth_direction parameter is deprecated and will be removed in the future. "
+        "Use positive values for immersion_depth to move into the liquid, and negative values to move "
+        "out of the liquid.",
+        DeprecationWarning,
+      )
+
+    if liquid_surface_sink_distance_at_the_end_of_dispense != 0:
+      surface_following_distance = liquid_surface_sink_distance_at_the_end_of_dispense
+      warnings.warn(
+        "The liquid_surface_sink_distance_at_the_end_of_dispense parameter is deprecated and will be removed in the future. "
+        "Use the Hamilton-standard surface_following_distance parameter instead.\n"
+        "liquid_surface_sink_distance_at_the_end_of_dispense currently superseding surface_following_distance.",
+        DeprecationWarning,
+      )
+
+    if maximum_immersion_depth is not None:
+      minimum_height = maximum_immersion_depth
+      warnings.warn(
+        "The maximum_immersion_depth parameter is deprecated and will be removed in the future. "
+        "Use the Hamilton-standard minimum_height parameter instead.\n"
+        "minimum_height currently superseding maximum_immersion_depth.",
+        DeprecationWarning,
+      )
+
+    if minimal_end_height is not None:
+      min_z_endpos = minimal_end_height
+      warnings.warn(
+        "The minimal_end_height parameter is deprecated and will be removed in the future. "
+        "Use the Hamilton-standard min_z_endpos parameter instead.\n"
+        "min_z_endpos currently superseding minimal_end_height.",
+        DeprecationWarning,
+      )
+
+    if mixing_position_from_liquid_surface != 0:
+      mix_position_from_liquid_surface = mixing_position_from_liquid_surface
+      warnings.warn(
+        "The mixing_position_from_liquid_surface parameter is deprecated and will be removed in the future "
+        "Use the Hamilton-standard mix_position_from_liquid_surface parameter instead.\n"
+        "mix_position_from_liquid_surface currently superseding mixing_position_from_liquid_surface.",
+        DeprecationWarning,
+      )
+
+    if surface_following_distance_during_mixing != 0:
+      mix_surface_following_distance = surface_following_distance_during_mixing
+      warnings.warn(
+        "The surface_following_distance_during_mixing parameter is deprecated and will be removed in the future. "
+        "Use the Hamilton-standard mix_surface_following_distance parameter instead.\n"
+        "mix_surface_following_distance currently superseding surface_following_distance_during_mixing.",
+        DeprecationWarning,
+      )
+
+    if air_transport_retract_dist != 10:
+      pull_out_distance_transport_air = air_transport_retract_dist
+      warnings.warn(
+        "The air_transport_retract_dist parameter is deprecated and will be removed in the future. "
+        "Use the Hamilton-standard pull_out_distance_transport_air parameter instead.\n"
+        "pull_out_distance_transport_air currently superseding air_transport_retract_dist.",
+        DeprecationWarning,
+      )
+
+    if tube_2nd_section_ratio != 618.0:
+      second_section_ratio = tube_2nd_section_ratio
+      warnings.warn(
+        "The tube_2nd_section_ratio parameter is deprecated and will be removed in the future. "
+        "Use the Hamilton-standard second_section_ratio parameter instead.\n"
+        "second_section_ratio currently superseding tube_2nd_section_ratio.",
+        DeprecationWarning,
+      )
+
+    if tube_2nd_section_height_measured_from_zm != 3.2:
+      second_section_height = tube_2nd_section_height_measured_from_zm
+      warnings.warn(
+        "The tube_2nd_section_height_measured_from_zm parameter is deprecated and will be removed in the future. "
+        "Use the Hamilton-standard second_section_height parameter instead.\n"
+        "second_section_height currently superseding tube_2nd_section_height_measured_from_zm.",
+        DeprecationWarning,
+      )
+
+    if dispense_mode is not None:
+      warnings.warn(
+        "The dispense_mode parameter is deprecated and will be removed in the future. "
+        "Use the combination of the `jet`, `empty` and `blow_out` parameters instead. "
+        "dispense_mode currently superseding those parameters.",
+        DeprecationWarning,
+      )
+    else:
+      dispense_mode = _dispensing_mode_for_op(empty=empty, jet=jet, blow_out=blow_out)
+    # # # delete # # #
 
     assert self.core96_head_installed, "96 head must be installed"
 
     # get the first well and tip as representatives
     if isinstance(dispense, MultiHeadDispensePlate):
-      top_left_well = dispense.wells[0]
+      plate = dispense.wells[0].parent
+      assert isinstance(plate, Plate), "MultiHeadDispensePlate well parent must be a Plate"
+      rot = plate.get_absolute_rotation()
+      if rot.x % 360 != 0 or rot.y % 360 != 0:
+        raise ValueError("Plate rotation around x or y is not supported for 96 head operations")
+      if rot.z % 360 == 180:
+        ref_well = plate.get_well("H12")
+      elif rot.z % 360 == 0:
+        ref_well = plate.get_well("A1")
+      else:
+        raise ValueError("96 head only supports plate rotations of 0 or 180 degrees around z")
+
       position = (
-        top_left_well.get_absolute_location()
-        + top_left_well.center()
-        + Coordinate(z=top_left_well.material_z_thickness)
+        ref_well.get_location_wrt(self.deck)
+        + ref_well.center()
+        + Coordinate(z=ref_well.material_z_thickness)
         + dispense.offset
       )
     else:
@@ -2512,35 +3449,30 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
       x_position = (dispense.container.get_absolute_size_x() - x_width) / 2
       y_position = (dispense.container.get_absolute_size_y() - y_width) / 2 + y_width
       position = (
-        dispense.container.get_absolute_location(z="cavity_bottom")
+        dispense.container.get_location_wrt(self.deck, z="cavity_bottom")
         + Coordinate(x=x_position, y=y_position)
         + dispense.offset
       )
-    tip = dispense.tips[0]
+    self._check_96_position_legal(position, skip_z=True)
+    tip = next(tip for tip in dispense.tips if tip is not None)
 
-    liquid_height = position.z + liquid_height
+    liquid_height = position.z + (dispense.liquid_height or 0)
 
-    dispense_mode = _dispensing_mode_for_op(empty=empty, jet=jet, blow_out=blow_out)
-
-    liquid_to_be_dispensed = Liquid.WATER  # default to water.
-    if len(dispense.liquids[0]) > 0 and dispense.liquids[0][-1][0] is not None:
-      # [channel][liquid][PyLabRobot.resources.liquid.Liquid]
-      liquid_to_be_dispensed = dispense.liquids[0][-1][0]
     hlc = hlc or get_star_liquid_class(
       tip_volume=tip.maximal_volume,
       is_core=True,
       is_tip=True,
       has_filter=tip.has_filter,
       # get last liquid in pipette, first to be dispensed
-      liquid=liquid_to_be_dispensed,
+      liquid=Liquid.WATER,  # default to WATER
       jet=jet,
       blow_out=blow_out,  # see comment in method docstring
     )
 
-    if hlc is not None:
-      volume = hlc.compute_corrected_volume(dispense.volume)
-    else:
+    if disable_volume_correction or hlc is None:
       volume = dispense.volume
+    else:  # hlc is not None and not disable_volume_correction
+      volume = hlc.compute_corrected_volume(dispense.volume)
 
     transport_air_volume = transport_air_volume or (
       hlc.dispense_air_transport_volume if hlc is not None else 0
@@ -2551,32 +3483,25 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
     flow_rate = dispense.flow_rate or (hlc.dispense_flow_rate if hlc is not None else 120)
     swap_speed = swap_speed or (hlc.dispense_swap_speed if hlc is not None else 100)
     settling_time = settling_time or (hlc.dispense_settling_time if hlc is not None else 5)
-    speed_of_mixing = speed_of_mixing or (hlc.dispense_mix_flow_rate if hlc is not None else 100)
 
-    channel_pattern = [True] * 12 * 8
-
-    ret = await self.dispense_core_96(
+    return await self.dispense_core_96(
       dispensing_mode=dispense_mode,
-      x_position=round(position.x * 10),
-      x_direction=0,
+      x_position=abs(round(position.x * 10)),
+      x_direction=0 if position.x >= 0 else 1,
       y_position=round(position.y * 10),
       minimum_traverse_height_at_beginning_of_a_command=round(
         (minimum_traverse_height_at_beginning_of_a_command or self._channel_traversal_height) * 10
       ),
-      minimal_end_height=round((minimal_end_height or self._channel_traversal_height) * 10),
+      min_z_endpos=round((min_z_endpos or self._channel_traversal_height) * 10),
       lld_search_height=round(lld_search_height * 10),
-      liquid_surface_at_function_without_lld=round(liquid_height * 10),
-      pull_out_distance_to_take_transport_air_in_function_without_lld=round(
-        air_transport_retract_dist * 10
-      ),
-      maximum_immersion_depth=maximum_immersion_depth or round(position.z * 10),
-      tube_2nd_section_height_measured_from_zm=round(tube_2nd_section_height_measured_from_zm * 10),
-      tube_2nd_section_ratio=round(tube_2nd_section_ratio * 10),
+      liquid_surface_no_lld=round(liquid_height * 10),
+      pull_out_distance_transport_air=round(pull_out_distance_transport_air * 10),
+      minimum_height=round((minimum_height or position.z) * 10),
+      second_section_height=round(second_section_height * 10),
+      second_section_ratio=round(second_section_ratio * 10),
       immersion_depth=round(immersion_depth * 10),
-      immersion_depth_direction=immersion_depth_direction,
-      liquid_surface_sink_distance_at_the_end_of_dispense=round(
-        liquid_surface_sink_distance_at_the_end_of_dispense * 10
-      ),
+      immersion_depth_direction=immersion_depth_direction or (0 if (immersion_depth >= 0) else 1),
+      surface_following_distance=round(surface_following_distance * 10),
       dispense_volume=round(volume * 10),
       dispense_speed=round(flow_rate * 10),
       transport_air_volume=round(transport_air_volume * 10),
@@ -2585,33 +3510,18 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
       gamma_lld_sensitivity=gamma_lld_sensitivity,
       swap_speed=round(swap_speed * 10),
       settling_time=round(settling_time * 10),
-      mixing_volume=round(mixing_volume * 10),
-      mixing_cycles=mixing_cycles,
-      mixing_position_from_liquid_surface=round(mixing_position_from_liquid_surface * 10),
-      surface_following_distance_during_mixing=round(surface_following_distance_during_mixing * 10),
-      speed_of_mixing=round(speed_of_mixing * 10),
-      channel_pattern=channel_pattern,
+      mixing_volume=round(dispense.mix.volume * 10) if dispense.mix is not None else 0,
+      mixing_cycles=dispense.mix.repetitions if dispense.mix is not None else 0,
+      mix_position_from_liquid_surface=round(mix_position_from_liquid_surface * 10),
+      mix_surface_following_distance=round(mix_surface_following_distance * 10),
+      speed_of_mixing=round(dispense.mix.flow_rate * 10) if dispense.mix is not None else 1200,
+      channel_pattern=[True] * 12 * 8,
       limit_curve_index=limit_curve_index,
       tadm_algorithm=False,
       recording_mode=0,
       cut_off_speed=round(cut_off_speed * 10),
       stop_back_volume=round(stop_back_volume * 10),
     )
-
-    # Was this ever true? Just copied it over from pyhamilton. Could have something to do with
-    # the liquid classes and whether blow_out mode is enabled.
-    # # Unfortunately, `blow_out_air_volume` does not work correctly, so instead we dispense air
-    # # manually.
-    # if blow_out_air_volume is not None and blow_out_air_volume > 0:
-    #   await self.dispense_core_96(
-    #     x_position=int(position.x * 10),
-    #     y_position=int(position.y * 10),
-    #     lld_mode=0,
-    #     liquid_surface_at_function_without_lld=int((liquid_height + 30) * 10),
-    #     dispense_volume=int(blow_out_air_volume * 10),
-    #   )
-
-    return ret
 
   async def iswap_move_picked_up_resource(
     self,
@@ -2628,11 +3538,14 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
 
     assert self.iswap_installed, "iswap must be installed"
 
+    x_direction = 0 if center.x >= 0 else 1
+    y_direction = 0 if center.y >= 0 else 1
+
     await self.move_plate_to_position(
-      x_position=round(center.x * 10),
-      x_direction=0,
-      y_position=round(center.y * 10),
-      y_direction=0,
+      x_position=round(abs(center.x) * 10),
+      x_direction=x_direction,
+      y_position=round(abs(center.y) * 10),
+      y_direction=y_direction,
       z_position=round(center.z * 10),
       z_direction=0,
       grip_direction={
@@ -2659,8 +3572,7 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
     grip_strength: int = 15,
     z_speed: float = 50.0,
     y_gripping_speed: float = 5.0,
-    channel_1: int = 7,
-    channel_2: int = 8,
+    front_channel: int = 7,
   ):
     """Pick up resource with CoRe gripper tool
     Low level component of :meth:`move_resource`
@@ -2675,17 +3587,16 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
       grip_strength: Grip strength (0 = weak, 99 = strong). Must be between 0 and 99. Default 15.
       z_speed: Z speed [mm/s]. Must be between 0.4 and 128.7. Default 50.0.
       y_gripping_speed: Y gripping speed [mm/s]. Must be between 0 and 370.0. Default 5.0.
-      channel_1: Channel 1. Must be between 0 and self._num_channels - 1. Default 7.
-      channel_2: Channel 2. Must be between 1 and self._num_channels. Default 8.
+      front_channel: Channel 1. Must be between 1 and self._num_channels - 1. Default 7.
     """
 
     # Get center of source plate. Also gripping height and plate width.
-    center = resource.get_absolute_location(x="c", y="c", z="b") + offset
+    center = resource.get_location_wrt(self.deck, x="c", y="c", z="b") + offset
     grip_height = center.z + resource.get_absolute_size_z() - pickup_distance_from_top
     grip_width = resource.get_absolute_size_y()  # grip width is y size of resource
 
     if self.core_parked:
-      await self.get_core(p1=channel_1, p2=channel_2)
+      await self.pick_up_core_gripper_tools(front_channel=front_channel)
 
     await self.core_get_plate(
       x_position=round(center.x * 10),
@@ -2712,7 +3623,7 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
     acceleration_index: int = 4,
     z_speed: float = 50.0,
   ):
-    """After a ressource is picked up, move it to a new location but don't release it yet.
+    """After a resource is picked up, move it to a new location but don't release it yet.
     Low level component of :meth:`move_resource`
 
     Args:
@@ -2787,8 +3698,7 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
     self,
     pickup: ResourcePickup,
     use_arm: Literal["iswap", "core"] = "iswap",
-    channel_1: int = 7,
-    channel_2: int = 8,
+    core_front_channel: int = 7,
     iswap_grip_strength: int = 4,
     core_grip_strength: int = 15,
     minimum_traverse_height_at_beginning_of_a_command: Optional[float] = None,
@@ -2801,7 +3711,10 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
     plate_width: Optional[float] = None,
     use_unsafe_hotel: bool = False,
     iswap_collision_control_level: int = 0,
-    iswap_fold_up_sequence_at_the_end_of_process: bool = True,
+    iswap_fold_up_sequence_at_the_end_of_process: bool = False,
+    # deprecated
+    channel_1: Optional[int] = None,
+    channel_2: Optional[int] = None,
   ):
     if use_arm == "iswap":
       assert (
@@ -2819,7 +3732,7 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
         pickup.resource.get_absolute_rotation()
       )
       x, y, z = (
-        pickup.resource.get_absolute_location("l", "f", "t")
+        pickup.resource.get_location_wrt(self.deck, "l", "f", "t")
         + center_in_absolute_space
         + pickup.offset
       )
@@ -2887,14 +3800,30 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
       if use_unsafe_hotel:
         raise ValueError("Cannot use iswap hotel mode with core grippers")
 
+      if pickup.direction != GripDirection.FRONT:
+        raise NotImplementedError("Core grippers only support FRONT (default)")
+
+      if channel_1 is not None or channel_2 is not None:
+        warnings.warn(
+          "The channel_1 and channel_2 parameters are deprecated and will be removed in future versions. "
+          "Please use the core_front_channel parameter instead.",
+          DeprecationWarning,
+        )
+        assert (
+          channel_1 is not None and channel_2 is not None
+        ), "Both channel_1 and channel_2 must be provided"
+        assert channel_1 + 1 == channel_2, "channel_2 must be channel_1 + 1"
+        core_front_channel = (
+          channel_2 - 1
+        )  # core_front_channel is the first channel of the gripper tool
+
       await self.core_pick_up_resource(
         resource=pickup.resource,
         pickup_distance_from_top=pickup.pickup_distance_from_top,
         offset=pickup.offset,
         minimum_traverse_height_at_beginning_of_a_command=self._iswap_traversal_height,
         minimum_z_position_at_the_command_end=self._iswap_traversal_height,
-        channel_1=channel_1,
-        channel_2=channel_2,
+        front_channel=core_front_channel,
         grip_strength=core_grip_strength,
       )
     else:
@@ -3004,7 +3933,7 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
           hotel_center_z_direction=0 if z >= 0 else 1,
           clearance_height=round(hotel_clearance_height * 10),
           hotel_depth=round(hotel_depth * 10),
-          grip_direction=drop.drop_direction,
+          grip_direction=drop.direction,
           open_gripper_position=round(open_gripper_position * 10),
           traverse_height_at_beginning=round(traversal_height_start * 10),
           z_position_at_end=round(z_position_at_the_command_end * 10),
@@ -3024,7 +3953,7 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
             GripDirection.RIGHT: 2,
             GripDirection.BACK: 3,
             GripDirection.LEFT: 4,
-          }[drop.drop_direction],
+          }[drop.direction],
           minimum_traverse_height_at_beginning_of_a_command=round(traversal_height_start * 10),
           z_position_at_the_command_end=round(z_position_at_the_command_end * 10),
           open_gripper_position=round(open_gripper_position * 10),
@@ -3034,6 +3963,9 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
     elif use_arm == "core":
       if use_unsafe_hotel:
         raise ValueError("Cannot use iswap hotel mode with core grippers")
+
+      if drop.direction != GripDirection.FRONT:
+        raise NotImplementedError("Core grippers only support FRONT direction (default)")
 
       await self.core_release_picked_up_resource(
         location=Coordinate(x, y, z),
@@ -3069,10 +4001,15 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
           f"(channel {channel - 1} y-position is {round(y, 2)} mm)"
         )
     else:
-      # STAR machines appear to lose connection to a channel if y > 635 mm
-      max_y_pos = 635
+      if self.iswap_installed:
+        max_y_pos = await self.iswap_rotation_drive_request_y()
+        limit = "iswap module y-position"
+      else:
+        # STAR machines do not allow channels y > 635 mm
+        max_y_pos = 635
+        limit = "machine limit"
       if y > max_y_pos:
-        raise ValueError(f"channel {channel} y-target must be <= {max_y_pos} mm (machine limit)")
+        raise ValueError(f"channel {channel} y-target must be <= {max_y_pos} mm ({limit})")
 
     if channel < (self.num_channels - 1):
       min_y_pos = await self.request_y_pos_channel_n(channel + 1)
@@ -3082,7 +4019,7 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
           f"(channel {channel + 1} y-position is {round(y, 2)} mm)"
         )
     else:
-      # STAR machines appear to lose connection to a channel if y < 6 mm
+      # STAR machines do not allow channels y < 6 mm
       min_y_pos = 6
       if y < min_y_pos:
         raise ValueError(f"channel {channel} y-target must be >= {min_y_pos} mm (machine limit)")
@@ -3096,6 +4033,21 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
     await self.position_single_pipetting_channel_in_z_direction(
       pipetting_channel_index=channel + 1, z_position=round(z * 10)
     )
+
+  async def move_channel_x_relative(self, channel: int, distance: float):
+    """Move a channel in the x direction by a relative amount."""
+    current_x = await self.request_x_pos_channel_n(channel)
+    await self.move_channel_x(channel, current_x + distance)
+
+  async def move_channel_y_relative(self, channel: int, distance: float):
+    """Move a channel in the y direction by a relative amount."""
+    current_y = await self.request_y_pos_channel_n(channel)
+    await self.move_channel_y(channel, current_y + distance)
+
+  async def move_channel_z_relative(self, channel: int, distance: float):
+    """Move a channel in the z direction by a relative amount."""
+    current_z = await self.request_z_pos_channel_n(channel)
+    await self.move_channel_z(channel, current_z + distance)
 
   def can_pick_up_tip(self, channel_idx: int, tip: Tip) -> bool:
     if not isinstance(tip, HamiltonTip):
@@ -3118,7 +4070,8 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
     """Check existence of resource with CoRe gripper tool
     a "Get plate using CO-RE gripper" + error handling
     Which channels are used for resource check is dependent on which channels have been used for
-    `STAR.get_core(p1: int, p2: int)` which is a prerequisite for this check function.
+    `STARBackend.get_core(p1: int, p2: int)` (channel indices are 0-based) which is a prerequisite
+    for this check function.
 
     Args:
       location: Location to check for resource
@@ -3215,10 +4168,39 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
     head_size_x = 9 * 11  # 12 channels, 9mm spacing in between
     head_size_y = 9 * 7  #   8 channels, 9mm spacing in between
     channel_size = 9
-    loc = resource.get_absolute_location()
+    loc = resource.get_location_wrt(self.deck)
     loc.x += (resource.get_size_x() - head_size_x) / 2 + channel_size / 2
     loc.y += (resource.get_size_y() - head_size_y) / 2 + channel_size / 2
     return loc
+
+  def _check_96_position_legal(self, c: Coordinate, skip_z=False) -> None:
+    """Validate that a coordinate is within the allowed range for the 96 head.
+
+    Args:
+      c: The coordinate of the A1 position of the head.
+      skip_z: If True, the z coordinate is not checked. This is useful for commands that handle
+        the z coordinate separately, such as the big four.
+
+    Raises:
+      ValueError: If one or more components are out of range. The error message contains all offending components.
+    """
+
+    # TODO: these are values for a STARBackend. Find them for a STARlet.
+
+    errors = []
+    if not (-271.0 <= c.x <= 974.0):
+      errors.append(f"x={c.x}")
+    if not (108.0 <= c.y <= 560.0):
+      errors.append(f"y={c.y}")
+    if not (180.5 <= c.z <= 342.5) and not skip_z:
+      errors.append(f"z={c.z}")
+
+    if len(errors) > 0:
+      raise ValueError(
+        "Illegal 96 head position: "
+        + ", ".join(errors)
+        + " (allowed ranges: x [-271, 974], y [108, 560], z [180.5, 342.5])"
+      )
 
   # ============== Firmware Commands ==============
 
@@ -3226,7 +4208,7 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
 
   async def pre_initialize_instrument(self):
     """Pre-initialize instrument"""
-    return await self.send_command(module="C0", command="VI")
+    return await self.send_command(module="C0", command="VI", read_timeout=300)
 
   async def define_tip_needle(
     self,
@@ -3315,9 +4297,9 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
 
     resp = await self.send_command(module="C0", command="QB")
     try:
-      return STAR.BoardType(resp["qb"])
+      return STARBackend.BoardType(resp["qb"])
     except ValueError:
-      return STAR.BoardType.UNKNOWN
+      return STARBackend.BoardType.UNKNOWN
 
   # TODO: parse response.
   async def request_supply_voltage(self):
@@ -3727,6 +4709,10 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
     # TODO: parse res
     return await self.send_command(module="C0", command="RI")
 
+  async def request_device_serial_number(self) -> str:
+    """Request device serial number"""
+    return (await self.send_command("C0", "RI", fmt="si####sn&&&&sn&&&&"))["sn"]  # type: ignore
+
   async def request_download_date(self):
     """Request download date"""
 
@@ -3933,15 +4919,16 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
 
   # -------------- 3.4.3 X-query --------------
 
-  async def request_left_x_arm_position(self):
+  async def request_left_x_arm_position(self) -> float:
     """Request left X-Arm position"""
+    resp_dmm = await self.send_command(module="C0", command="RX", fmt="rx#####")
+    return cast(float, resp_dmm["rx"]) / 10
 
-    return await self.send_command(module="C0", command="RX", fmt="rx#####")
-
-  async def request_right_x_arm_position(self):
+  async def request_right_x_arm_position(self) -> float:
     """Request right X-Arm position"""
 
-    return await self.send_command(module="C0", command="QX", fmt="rx#####")
+    resp_dmm = await self.send_command(module="C0", command="QX", fmt="rx#####")
+    return cast(float, resp_dmm["rx"]) / 10
 
   async def request_maximal_ranges_of_x_drives(self):
     """Request maximal ranges of X drives"""
@@ -3978,6 +4965,22 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
   # -------------- 3.5 Pipetting channel commands --------------
 
   # -------------- 3.5.1 Initialization --------------
+
+  async def initialize_pip(self):
+    """Wrapper around initialize_pipetting_channels firmware command."""
+    dy = (4050 - 2175) // (self.num_channels - 1)
+    y_positions = [4050 - i * dy for i in range(self.num_channels)]
+
+    await self.initialize_pipetting_channels(
+      x_positions=[self.extended_conf["xw"]],  # Tip eject waste X position.
+      y_positions=y_positions,
+      begin_of_tip_deposit_process=int(self._channel_traversal_height * 10),
+      end_of_tip_deposit_process=1220,
+      z_position_at_end_of_a_command=3600,
+      tip_pattern=[True] * self.num_channels,
+      tip_type=4,  # TODO: get from tip types
+      discarding_method=0,
+    )
 
   async def initialize_pipetting_channels(
     self,
@@ -4213,8 +5216,9 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
     dosing_drive_speed_during_2nd_section_search: List[int] = [468],
     z_drive_speed_during_2nd_section_search: List[int] = [215],
     cup_upper_edge: List[int] = [3600],
-    ratio_liquid_rise_to_tip_deep_in: List[int] = [16246],
-    immersion_depth_2nd_section: List[int] = [30],
+    # deprecated, remove >2026-06
+    ratio_liquid_rise_to_tip_deep_in: Optional[List[int]] = None,
+    immersion_depth_2nd_section: Optional[List[int]] = None,
   ):
     """aspirate pip
 
@@ -4297,11 +5301,20 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
       z_drive_speed_during_2nd_section_search: Z drive speed during 2nd section search [0.1mm/s].
           Must be between 3 and 1600. Default 215.
       cup_upper_edge: Cup upper edge [0.1mm]. Must be between 0 and 3600. Default 3600.
-      ratio_liquid_rise_to_tip_deep_in: Ratio liquid rise to tip deep in [1/100000]. Must be
-          between 0 and 50000. Default 16246.
-      immersion_depth_2nd_section: Immersion depth 2nd section [0.1mm]. Must be between 0 and
-          3600. Default 30.
     """
+
+    if ratio_liquid_rise_to_tip_deep_in is not None:
+      warnings.warn(
+        "ratio_liquid_rise_to_tip_deep_in is deprecated and will be removed in a future version.",
+        DeprecationWarning,
+        stacklevel=2,
+      )
+    if immersion_depth_2nd_section is not None:
+      warnings.warn(
+        "immersion_depth_2nd_section is deprecated and will be removed in a future version.",
+        DeprecationWarning,
+        stacklevel=2,
+      )
 
     assert all(0 <= x <= 2 for x in aspiration_type), "aspiration_type must be between 0 and 2"
     assert all(0 <= xp <= 25000 for xp in x_positions), "x_positions must be between 0 and 25000"
@@ -4394,18 +5407,12 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
       3 <= x <= 1600 for x in z_drive_speed_during_2nd_section_search
     ), "z_drive_speed_during_2nd_section_search must be between 3 and 1600"
     assert all(0 <= x <= 3600 for x in cup_upper_edge), "cup_upper_edge must be between 0 and 3600"
-    assert all(
-      0 <= x <= 5000 for x in ratio_liquid_rise_to_tip_deep_in
-    ), "ratio_liquid_rise_to_tip_deep_in must be between 0 and 50000"
-    assert all(
-      0 <= x <= 3600 for x in immersion_depth_2nd_section
-    ), "immersion_depth_2nd_section must be between 0 and 3600"
 
     return await self.send_command(
       module="C0",
       command="AS",
       tip_pattern=tip_pattern,
-      read_timeout=max(120, self.read_timeout),
+      read_timeout=max(300, self.read_timeout),
       at=[f"{at:01}" for at in aspiration_type],
       tm=tip_pattern,
       xp=[f"{xp:05}" for xp in x_positions],
@@ -4448,8 +5455,6 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
       se=[f"{se:04}" for se in dosing_drive_speed_during_2nd_section_search],
       sz=[f"{sz:04}" for sz in z_drive_speed_during_2nd_section_search],
       io=[f"{io:04}" for io in cup_upper_edge],
-      il=[f"{il:05}" for il in ratio_liquid_rise_to_tip_deep_in],
-      in_=[f"{in_:04}" for in_ in immersion_depth_2nd_section],
     )
 
   @need_iswap_parked
@@ -4639,7 +5644,7 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
       module="C0",
       command="DS",
       tip_pattern=tip_pattern,
-      read_timeout=max(120, self.read_timeout),
+      read_timeout=max(300, self.read_timeout),
       dm=[f"{dm:01}" for dm in dispensing_mode],
       tm=[f"{tm:01}" for tm in tip_pattern],
       xp=[f"{xp:05}" for xp in x_positions],
@@ -4686,62 +5691,127 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
 
   # -------------- 3.5.5 CoRe gripper commands --------------
 
-  @need_iswap_parked
-  async def get_core(self, p1: int, p2: int):
-    """Get CoRe gripper tool from wasteblock mount."""
-    if not 0 <= p1 < self.num_channels:
-      raise ValueError(f"channel_1 must be between 0 and {self.num_channels - 1}")
-    if not 1 <= p2 <= self.num_channels:
-      raise ValueError(f"channel_2 must be between 1 and {self.num_channels}")
+  def _get_core_front_back(self):
+    core_grippers = self.deck.get_resource("core_grippers")
+    assert isinstance(core_grippers, HamiltonCoreGrippers), "core_grippers must be CoReGrippers"
+    back_channel_y_center = int(
+      (
+        core_grippers.get_location_wrt(self.deck).y
+        + core_grippers.back_channel_y_center
+        + self.core_adjustment.y
+      )
+    )
+    front_channel_y_center = int(
+      (
+        core_grippers.get_location_wrt(self.deck).y
+        + core_grippers.front_channel_y_center
+        + self.core_adjustment.y
+      )
+    )
+    assert (
+      back_channel_y_center > front_channel_y_center
+    ), "back_channel_y_center must be greater than front_channel_y_center"
+    assert front_channel_y_center > 6, "front_channel_y_center must be less than 6mm"
+    return back_channel_y_center, front_channel_y_center
 
-    # This appears to be deck.get_size_x() - 562.5, but let's keep an explicit check so that we
-    # can catch unknown deck sizes. Can the grippers exist at another location? If so, define it as
-    # a resource on the robot deck and use deck.get_resource().get_absolute_location().
-    deck_size = self.deck.get_absolute_size_x()
-    if deck_size == STARLET_SIZE_X:
-      xs = 7975  # 1360-797.5 = 562.5
-    elif deck_size == STAR_SIZE_X:
-      xs = 13385  # 1900-1337.5 = 562.5, plus a manual adjustment of + 10
-    else:
-      raise ValueError(f"Deck size {deck_size} not supported")
+  def _get_core_x(self) -> float:
+    """Get the X coordinate for the CoRe grippers based on deck size and adjustment."""
+    core_grippers = self.deck.get_resource("core_grippers")
+    assert isinstance(core_grippers, HamiltonCoreGrippers), "core_grippers must be CoReGrippers"
+    return core_grippers.get_location_wrt(self.deck).x + self.core_adjustment.x
+
+  async def get_core(self, p1: int, p2: int):
+    warnings.warn("Deprecated. Use pick_up_core_gripper_tools instead.", DeprecationWarning)
+    assert p1 + 1 == p2, "p2 must be p1 + 1"
+    return await self.pick_up_core_gripper_tools(front_channel=p2 - 1)  # p1 here is 1-indexed
+
+  @need_iswap_parked
+  async def pick_up_core_gripper_tools(
+    self,
+    front_channel: int,
+    front_offset: Optional[Coordinate] = None,
+    back_offset: Optional[Coordinate] = None,
+  ):
+    """Get CoRe gripper tool from wasteblock mount."""
+
+    if not 0 < front_channel < self.num_channels:
+      raise ValueError(f"front_channel must be between 1 and {self.num_channels - 1} (inclusive)")
+    back_channel = front_channel - 1
+
+    # Only enforce x equality if both offsets are explicitly provided.
+    if front_offset is not None and back_offset is not None and front_offset.x != back_offset.x:
+      raise ValueError("front_offset.x and back_offset.x must be the same")
+
+    xs = self._get_core_x() + (front_offset.x if front_offset is not None else 0)
+
+    back_channel_y_center, front_channel_y_center = self._get_core_front_back()
+    if back_offset is not None:
+      back_channel_y_center += back_offset.y
+    if front_offset is not None:
+      front_channel_y_center += front_offset.y
+
+    if front_offset is not None and back_offset is not None and front_offset.z != back_offset.z:
+      raise ValueError("front_offset.z and back_offset.z must be the same")
+    z_offset = 0 if front_offset is None else front_offset.z
+    begin_z_coord = round(235.0 + self.core_adjustment.z + z_offset)
+    end_z_coord = round(225.0 + self.core_adjustment.z + z_offset)
 
     command_output = await self.send_command(
       module="C0",
       command="ZT",
-      xs=f"{xs + self.core_adjustment.x:05}",
+      xs=f"{round(xs * 10):05}",
       xd="0",
-      ya=f"{1240 + self.core_adjustment.y:04}",
-      yb=f"{1065 + self.core_adjustment.y:04}",
-      pa=f"{p1:02}",
-      pb=f"{p2:02}",
-      tp=f"{2350 + self.core_adjustment.z:04}",
-      tz=f"{2250 + self.core_adjustment.z:04}",
+      ya=f"{round(back_channel_y_center * 10):04}",
+      yb=f"{round(front_channel_y_center * 10):04}",
+      pa=f"{back_channel+1:02}",  # star is 1-indexed
+      pb=f"{front_channel+1:02}",  # star is 1-indexed
+      tp=f"{round(begin_z_coord * 10):04}",
+      tz=f"{round(end_z_coord * 10):04}",
       th=round(self._iswap_traversal_height * 10),
       tt="14",
     )
     self._core_parked = False
     return command_output
 
-  @need_iswap_parked
   async def put_core(self):
+    warnings.warn("Deprecated. Use return_core_gripper_tools instead.", DeprecationWarning)
+    return await self.return_core_gripper_tools()
+
+  @need_iswap_parked
+  async def return_core_gripper_tools(
+    self,
+    front_offset: Optional[Coordinate] = None,
+    back_offset: Optional[Coordinate] = None,
+  ):
     """Put CoRe gripper tool at wasteblock mount."""
-    assert self.deck is not None, "must have deck defined to access CoRe grippers"
-    deck_size = self.deck.get_absolute_size_x()
-    if deck_size == STARLET_SIZE_X:
-      xs = 7975
-    elif deck_size == STAR_SIZE_X:
-      xs = 13385
-    else:
-      raise ValueError(f"Deck size {deck_size} not supported")
+
+    # Only enforce x equality if both offsets are explicitly provided.
+    if front_offset is not None and back_offset is not None and back_offset.x != front_offset.x:
+      raise ValueError("back_offset.x and front_offset.x must be the same")
+
+    xs = self._get_core_x() + (front_offset.x if front_offset is not None else 0)
+
+    back_channel_y_center, front_channel_y_center = self._get_core_front_back()
+    if back_offset is not None:
+      back_channel_y_center += back_offset.y
+    if front_offset is not None:
+      front_channel_y_center += front_offset.y
+
+    if front_offset is not None and back_offset is not None and back_offset.z != front_offset.z:
+      raise ValueError("back_offset.z and front_offset.z must be the same")
+    z_offset = 0 if front_offset is None else front_offset.z
+    begin_z_coord = round(215.0 + self.core_adjustment.z + z_offset)
+    end_z_coord = round(205.0 + self.core_adjustment.z + z_offset)
+
     command_output = await self.send_command(
       module="C0",
       command="ZS",
-      xs=f"{xs + self.core_adjustment.x:05}",
+      xs=f"{round(xs * 10):05}",
       xd="0",
-      ya=f"{1240 + self.core_adjustment.y:04}",
-      yb=f"{1065 + self.core_adjustment.y:04}",
-      tp=f"{2150 + self.core_adjustment.z:04}",
-      tz=f"{2050 + self.core_adjustment.z:04}",
+      ya=f"{round(back_channel_y_center * 10):04}",
+      yb=f"{round(front_channel_y_center * 10):04}",
+      tp=f"{round(begin_z_coord * 10):04}",
+      tz=f"{round(end_z_coord * 10):04}",
       th=round(self._iswap_traversal_height * 10),
       te=round(self._iswap_traversal_height * 10),
     )
@@ -4848,7 +5918,7 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
     )
 
     if return_tool:
-      await self.put_core()
+      await self.return_core_gripper_tools()
 
     return command_output
 
@@ -4879,7 +5949,145 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
 
     return command_output
 
-  # TODO:(command:ZB)
+  async def core_read_barcode_of_picked_up_resource(
+    self,
+    rails: int,
+    reading_direction: Literal["vertical", "horizontal", "free"] = "horizontal",
+    minimal_z_position: float = 220.0,
+    traverse_height_at_beginning_of_a_command: float = 275.0,
+    z_speed: float = 128.7,
+    allow_manual_input: bool = False,
+    labware_description: Optional[str] = None,
+  ):
+    """Read a 1D barcode using the CoRe gripper scanner.
+
+    Args:
+      rails: Rail/slot number where the barcode to be read is located (1-54).
+      reading_direction: Direction of barcode reading: 'vertical', 'horizontal', or 'free'. Default is 'horizontal'.
+      minimal_z_position: Minimal Z position [mm] during barcode reading (220.0-360.0). Default is 220.0.
+      traverse_height_at_beginning_of_a_command: Traverse height at beginning of command [mm] (0.0-360.0). Default is 275.0.
+      z_speed: Z speed [mm/s] during barcode reading (0.0-128.7). Default is 128.7.
+      allow_manual_input: If True, allows the user to manually input a barcode if scanning fails. Default is False.
+      labware_description: Optional description of the labware being scanned, used in the manual input
+        prompt to provide context to the user.
+
+    Returns:
+      A Barcode if one is successfully read, either by the scanner or via manual user input.
+
+    Raises:
+      STARFirmwareError: if the firmware reports an error in the response.
+      ValueError: if the response format is unexpected or if no barcode is present and
+        ``allow_manual_input`` is False, or if manual input is enabled but the user does not
+        provide a barcode.
+    """
+
+    assert 1 <= rails <= 54, "rails must be between 1 and 54"
+    assert 0 <= minimal_z_position <= 3600, "minimal_z_position must be between 0 and 3600"
+    assert (
+      0 <= traverse_height_at_beginning_of_a_command <= 3600
+    ), "traverse_height_at_beginning_of_a_command must be between 0 and 3600"
+    assert 0 <= z_speed <= 1287, "z_speed must be between 0 and 1287"
+
+    try:
+      reading_direction_int = {
+        "vertical": 0,
+        "horizontal": 1,
+        "free": 2,
+      }[reading_direction]
+    except KeyError as e:
+      raise ValueError(
+        "reading_direction must be one of 'vertical', 'horizontal', or 'free'"
+      ) from e
+
+    command_output = cast(
+      str,
+      await self.send_command(
+        module="C0",
+        command="ZB",
+        cp=f"{rails:02}",
+        zb=f"{round(minimal_z_position*10):04}",
+        th=f"{round(traverse_height_at_beginning_of_a_command*10):04}",
+        zy=f"{round(z_speed*10):04}",
+        bd=reading_direction_int,
+        ma="0250 2100 0860 0200",
+        mr=0,
+        mo="000 000 000 000 000 000 000",
+      ),
+    )
+
+    if command_output is None:
+      raise RuntimeError("No response received from CoRe barcode read command.")
+
+    resp = command_output.strip()
+    er_index = resp.find("er")
+    if er_index == -1:
+      # Unexpected format: no error section present.
+      raise ValueError(f"Unexpected CoRe barcode response (no error section): {resp}")
+
+    self.check_fw_string_error(resp)
+
+    # Parse barcode section: firmware returns `bb/LL<barcode>` where LL is length (00..99).
+    bb_index = resp.find("bb/", er_index + 7)
+    if bb_index == -1:
+      # Unexpected layout of barcode section.
+      raise ValueError(f"Unexpected CoRe barcode response format: {resp}")
+
+    if len(resp) < bb_index + 5:
+      # Need at least 'bb/LL'.
+      raise ValueError(f"Unexpected CoRe barcode response format: {resp}")
+
+    bb_len_str = resp[bb_index + 3 : bb_index + 5]
+    try:
+      bb_len = int(bb_len_str)
+    except ValueError as e:
+      raise ValueError(f"Invalid CoRe barcode length field 'bb': {bb_len_str}") from e
+
+    barcode_str = resp[bb_index + 5 :].strip()
+
+    # No barcode present.
+    if bb_len == 0:
+      if allow_manual_input:
+        # Provide context and allow the user to recover by entering a barcode manually.
+        # Use ANSI color codes to make the prompt stand out in typical terminals.
+        YELLOW = "\033[93m"
+        BOLD = "\033[1m"
+        RESET = "\033[0m"
+
+        lines = [
+          f"{YELLOW}{BOLD}=== CoRe barcode scan failed ==={RESET}",
+          f"{YELLOW}No barcode read by CoRe scanner.{RESET}",
+        ]
+        if labware_description is not None:
+          lines.append(f"{YELLOW}Labware: {labware_description}{RESET}")
+        lines.append(f"{YELLOW}Enter barcode manually (leave blank to abort): {RESET}")
+        prompt = "\n".join(lines)
+
+        # Blocking input is acceptable here because this helper is only intended for CLI usage.
+        user_barcode = input(prompt).strip()
+        if not user_barcode:
+          raise ValueError("No barcode read by CoRe scanner and no manual barcode provided.")
+
+        return Barcode(
+          data=user_barcode,
+          symbology="code128",
+          position_on_resource="front",
+        )
+
+      raise ValueError("No barcode read by CoRe scanner.")
+
+    if not barcode_str:
+      # Length > 0 but no data present.
+      raise ValueError(f"Unexpected CoRe barcode response format: {resp}")
+
+    # If the firmware returns more characters than declared, truncate to the declared length.
+    if len(barcode_str) > bb_len:
+      barcode_str = barcode_str[:bb_len]
+
+    return Barcode(
+      data=barcode_str,
+      symbology="code128",
+      position_on_resource="front",
+    )
 
   # -------------- 3.5.6 Adjustment & movement commands --------------
 
@@ -4914,8 +6122,7 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
 
     Args:
       pipetting_channel_index: Index of pipetting channel. Must be between 1 and 16.
-      z_position: y position [0.1mm]. Must be between 0 and 3347. The docs say 3600,but empirically
-        3347 is the max.
+      z_position: y position [0.1mm]. Must be between 0 and 3347. The docs say 3600,but empirically 3347 is the max.
     """
 
     assert (
@@ -5028,6 +6235,14 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
 
   # TODO:(command:RY): Request Y-Positions of all pipetting channels
 
+  async def request_x_pos_channel_n(self, pipetting_channel_index: int = 0) -> float:
+    """Request X-Position of Pipetting channel n (in mm)"""
+
+    resp = await self.request_left_x_arm_position()
+    # TODO: check validity for 2 X-arm system
+
+    return round(resp, 1)
+
   async def request_y_pos_channel_n(self, pipetting_channel_index: int) -> float:
     """Request Y-Position of Pipetting channel n
 
@@ -5054,25 +6269,35 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
   # TODO:(command:RZ): Request Z-Positions of all pipetting channels
 
   async def request_z_pos_channel_n(self, pipetting_channel_index: int) -> float:
-    """Request Z-Position of Pipetting channel n
+    warnings.warn(
+      "Deprecated. Use either request_tip_bottom_z_position or request_probe_z_position. "
+      "Returning request_tip_bottom_z_position for now."
+    )
+    return await self.request_tip_bottom_z_position(channel_idx=pipetting_channel_index)
+
+  async def request_tip_bottom_z_position(self, channel_idx: int) -> float:
+    """Request Z-Position of the tip bottom of the tip mounted at on channel `channel_idx`.
+
+    Requires a tip to be mounted and will raise if no tip is mounted.
+
+    To get the z-position of the probe (irrespective of tip), use `request_probe_z_position`.
 
     Args:
-      pipetting_channel_index: Index of pipetting channel. Must be between 0 and 15.
-        0 is the backmost channel.
-
-    Returns:
-      Z-Position of channel n [0.1mm]. Taking into account tip presence and length.
+      channel_idx: Index of pipetting channel. Must be between 0 and 15.  0 is the backmost channel.
     """
 
-    assert 0 <= pipetting_channel_index <= 15, "pipetting_channel_index must be between 0 and 15"
-    # convert Python's 0-based indexing to Hamilton firmware's 1-based indexing
-    pipetting_channel_index = pipetting_channel_index + 1
+    if not (await self.request_tip_presence())[channel_idx]:
+      raise RuntimeError(f"No tip mounted on channel {channel_idx}")
+
+    if not 0 <= channel_idx <= self.num_channels - 1:
+      raise ValueError("channel_idx must be in [0, num_channels - 1]")
 
     z_pos_query = await self.send_command(
       module="C0",
       command="RD",
       fmt="rd####",
-      pn=f"{pipetting_channel_index:02}",
+      # convert Python's 0-based indexing to Hamilton firmware's 1-based indexing
+      pn=f"{channel_idx + 1:02}",
     )
     # Extract z-coordinate and convert to mm
     return float(z_pos_query["rd"] / 10)
@@ -5087,14 +6312,37 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
     resp = await self.send_command(module="C0", command="RT", fmt="rt# (n)")
     return cast(List[int], resp.get("rt"))
 
-  async def request_pip_height_last_lld(self):
-    """Request PIP height of last LLD
+  async def request_pip_height_last_lld(self) -> List[float]:
+    """
+    Return the absolute liquid heights measured during the most recent
+    liquid-level detection (LLD) event for all channels.
+
+    This value is maintained internally by the STAR/STARlet firmware and is
+    updated **whenever a liquid level is detected**, regardless of whether the
+    detection method used was:
+    - capacitive LLD (cLLD == 'STAR.LLDMode(1)'), or
+    - pressure-based LLD (pLLD == 'STAR.LLDMode(2)').
+
+    Heights are returned in millimeters, one value per channel, ordered by
+    channel index.
 
     Returns:
-      LLD height of all channels
-    """
+      Absolute liquid heights (mm) from the last LLD event for each channel.
 
-    return await self.send_command(module="C0", command="RL", fmt="lh#### (n)")
+    Raises:
+      AssertionError: If the instrument response does not contain a valid ``"lh"`` list.
+    """
+    resp = await self.send_command(module="C0", command="RL", fmt="lh#### (n)")
+
+    liquid_levels = resp.get("lh")
+
+    assert (
+      len(liquid_levels) == self.num_channels
+    ), f"Expected {self.num_channels} liquid level values, got {len(liquid_levels)} instead"
+
+    current_absolute_liquid_heights = [float(lld_channel / 10) for lld_channel in liquid_levels]
+
+    return current_absolute_liquid_heights
 
   async def request_tadm_status(self):
     """Request PIP height of last LLD
@@ -5231,7 +6479,41 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
   # TODO:(command:OD)
   # TODO:(command:OT)
 
-  # -------------- 3.10 CoRe 96 Head commands --------------
+  # -------------- 3.10 96-Head commands --------------
+
+  async def head96_request_firmware_version(self) -> datetime.date:
+    """Request 96 Head firmware version (MEM-READ command)."""
+    resp: str = await self.send_command(module="H0", command="RF")
+    return self._parse_firmware_version_datetime(resp)
+
+  async def _head96_request_configuration(self) -> List[str]:
+    """Request the 96-head configuration (raw) using the QU command.
+
+    The instrument returns a sequence of positional tokens. This method returns
+    those tokens without decoding them, but the following indices are currently
+    understood:
+
+        - index 0: clot_monitoring_with_clld
+        - index 1: stop_disc_type (codes: 0=core_i, 1=core_ii)
+        - index 2: instrument_type (codes: 0=legacy, 1=FM-STAR)
+        - indices 3..9: reservable positions (positions 4..10)
+
+    Returns:
+      Raw positional tokens extracted from the QU response (the portion after the last ``"au"`` marker).
+    """
+    resp: str = await self.send_command(module="H0", command="QU")
+    return resp.split("au")[-1].split()
+
+  async def head96_request_type(self) -> Head96Information.HeadType:
+    """Send QG and return the 96-head type as a human-readable string."""
+    type_map: Dict[int, Head96Information.HeadType] = {
+      0: "Low volume head",
+      1: "High volume head",
+      2: "96 head II",
+      3: "96 head TADM",
+    }
+    resp = await self.send_command(module="H0", command="QG", fmt="qg#")
+    return type_map.get(resp["qg"], "unknown")
 
   # -------------- 3.10.1 Initialization --------------
 
@@ -5248,6 +6530,7 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
 
     # The firmware command expects location of tip A1 of the head.
     loc = self._position_96_head_in_resource(trash96)
+    self._check_96_position_legal(loc, skip_z=True)
 
     return await self.send_command(
       module="C0",
@@ -5260,15 +6543,268 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
       ze=f"{round(z_position_at_the_command_end*10):04}",
     )
 
-  async def move_core_96_to_safe_position(self):
-    """Move CoRe 96 Head to Z save position"""
-
-    return await self.send_command(module="C0", command="EV")
-
   async def request_core_96_head_initialization_status(self) -> bool:
     # not available in the C0 docs, so get from module H0 itself instead
     response = await self.send_command(module="H0", command="QW", fmt="qw#")
     return bool(response.get("qw", 0) == 1)  # type?
+
+  # -------------- 3.10.2 96-Head Movements --------------
+
+  # Conversion factors for 96-Head (mm per increment)
+  _head96_z_drive_mm_per_increment = 0.005
+  _head96_y_drive_mm_per_increment = 0.015625
+  _head96_dispensing_drive_mm_per_increment = 0.001025641026
+  _head96_dispensing_drive_uL_per_increment = 0.019340933
+  _head96_squeezer_drive_mm_per_increment = 0.0002086672009
+
+  # Z-axis conversions
+
+  def _head96_z_drive_mm_to_increment(self, value_mm: float) -> int:
+    """Convert mm to Z-axis hardware increments for 96-head."""
+    return round(value_mm / self._head96_z_drive_mm_per_increment)
+
+  def _head96_z_drive_increment_to_mm(self, value_increments: int) -> float:
+    """Convert Z-axis hardware increments to mm for 96-head."""
+    return round(value_increments * self._head96_z_drive_mm_per_increment, 2)
+
+  # Y-axis conversions
+
+  def _head96_y_drive_mm_to_increment(self, value_mm: float) -> int:
+    """Convert mm to Y-axis hardware increments for 96-head."""
+    return round(value_mm / self._head96_y_drive_mm_per_increment)
+
+  def _head96_y_drive_increment_to_mm(self, value_increments: int) -> float:
+    """Convert Y-axis hardware increments to mm for 96-head."""
+    return round(value_increments * self._head96_y_drive_mm_per_increment, 2)
+
+  # Dispensing drive conversions (mm and uL)
+
+  def _head96_dispensing_drive_mm_to_increment(self, value_mm: float) -> int:
+    """Convert mm to dispensing drive hardware increments for 96-head."""
+    return round(value_mm / self._head96_dispensing_drive_mm_per_increment)
+
+  def _head96_dispensing_drive_increment_to_mm(self, value_increments: int) -> float:
+    """Convert dispensing drive hardware increments to mm for 96-head."""
+    return round(value_increments * self._head96_dispensing_drive_mm_per_increment, 2)
+
+  def _head96_dispensing_drive_uL_to_increment(self, value_uL: float) -> int:
+    """Convert uL to dispensing drive hardware increments for 96-head."""
+    return round(value_uL / self._head96_dispensing_drive_uL_per_increment)
+
+  def _head96_dispensing_drive_increment_to_uL(self, value_increments: int) -> float:
+    """Convert dispensing drive hardware increments to uL for 96-head."""
+    return round(value_increments * self._head96_dispensing_drive_uL_per_increment, 2)
+
+  def _head96_dispensing_drive_mm_to_uL(self, value_mm: float) -> float:
+    """Convert dispensing drive mm to uL for 96-head."""
+    # Convert mm -> increment -> uL
+    increment = self._head96_dispensing_drive_mm_to_increment(value_mm)
+    return self._head96_dispensing_drive_increment_to_uL(increment)
+
+  def _head96_dispensing_drive_uL_to_mm(self, value_uL: float) -> float:
+    """Convert dispensing drive uL to mm for 96-head."""
+    # Convert uL -> increment -> mm
+    increment = self._head96_dispensing_drive_uL_to_increment(value_uL)
+    return self._head96_dispensing_drive_increment_to_mm(increment)
+
+  # Squeezer drive conversions
+
+  def _head96_squeezer_drive_mm_to_increment(self, value_mm: float) -> int:
+    """Convert mm to squeezer drive hardware increments for 96-head."""
+    return round(value_mm / self._head96_squeezer_drive_mm_per_increment)
+
+  def _head96_squeezer_drive_increment_to_mm(self, value_increments: int) -> float:
+    """Convert squeezer drive hardware increments to mm for 96-head."""
+    return round(value_increments * self._head96_squeezer_drive_mm_per_increment, 2)
+
+  # Movement commands
+
+  async def move_core_96_to_safe_position(self):
+    """Move CoRe 96 Head to Z safe position."""
+    warnings.warn(
+      "move_core_96_to_safe_position is deprecated. Use head96_move_to_z_safety instead. "
+      "This method will be removed in 2026-04",  # TODO: remove 2026-04
+      DeprecationWarning,
+      stacklevel=2,
+    )
+    return await self.head96_move_to_z_safety()
+
+  async def head96_move_to_z_safety(self):
+    """Move 96-Head to Z safety coordinate, i.e. z=342.5 mm."""
+    return await self.send_command(module="C0", command="EV")
+
+  async def head96_park(
+    self,
+  ):
+    """Park the 96-head.
+
+    Uses firmware default speeds and accelerations.
+    """
+
+    assert self.core96_head_installed, "requires 96-head to be installed"
+
+    return await self.send_command(module="H0", command="MO")
+
+  async def head96_move_x(self, x: float):
+    """Move the 96-head to a specified X-axis coordinate.
+
+    Note: Unlike head96_move_y and head96_move_z, the X-axis movement does not have
+    dedicated speed/acceleration parameters - it uses the EM command which moves
+    all axes together.
+
+    Args:
+      x: Target X coordinate in mm. Valid range: [-271.0, 974.0]
+
+    Returns:
+      Response from the hardware command.
+
+    Raises:
+      AssertionError: If 96-head not installed or parameter out of range.
+    """
+    assert self.core96_head_installed, "requires 96-head to be installed"
+    assert -271 <= x <= 974, "x must be between -271.0 and 974.0 mm"
+
+    current_pos = await self.head96_request_position()
+    return await self.head96_move_to_coordinate(
+      Coordinate(x, current_pos.y, current_pos.z),
+      minimum_height_at_beginning_of_a_command=current_pos.z - 10,
+    )
+
+  async def head96_move_y(
+    self,
+    y: float,
+    speed: float = 300.0,
+    acceleration: float = 300.0,
+    current_protection_limiter: int = 15,
+  ):
+    """Move the 96-head to a specified Y-axis coordinate.
+
+    Args:
+      y: Target Y coordinate in mm. Valid range: [93.75, 562.5]
+      speed: Movement speed in mm/sec. Valid range: [0.78125, 390.625 or 625.0]. Default: 300.0
+      acceleration: Movement acceleration in mm/sec**2. Valid range: [78.125, 781.25]. Default: 300.0
+      current_protection_limiter: Motor current limit (0-15, hardware units). Default: 15
+
+    Returns:
+      Response from the hardware command.
+
+    Raises:
+      AssertionError: If 96-head not installed, firmware info missing, or parameters out of range.
+
+    Note:
+      Maximum speed varies by firmware version:
+      - Pre-2021: 390.625 mm/sec (25,000 increments)
+      - 2021+: 625.0 mm/sec (40,000 increments)
+      The exact firmware version introducing this change is undocumented.
+    """
+    # Validate 96-head installation and firmware info availability
+    assert self.core96_head_installed, "requires 96-head to be installed"
+    assert (
+      self._head96_information is not None
+    ), "requires 96-head firmware version information for safe operation"
+
+    fw_version = self._head96_information.fw_version
+
+    # Determine speed limit based on firmware version
+    # Pre-2021 firmware appears to have lower speed capability or safety limits
+    # TODO: Verify exact firmware version and investigate the reason for this change
+    y_speed_upper_limit = 390.625 if fw_version.year <= 2021 else 625.0  # mm/sec
+
+    # Validate parameters before hardware communication
+    assert 93.75 <= y <= 562.5, "y must be between 93.75 and 562.5 mm"
+    assert 0.78125 <= speed <= y_speed_upper_limit, (
+      f"speed must be between 0.78125 and {y_speed_upper_limit} mm/sec for firmware version {fw_version}. "
+      f"Your firmware version: {self._head96_information.fw_version}. "
+      "If this limit seems incorrect, please test cautiously with an empty deck and report "
+      "accurate limits + firmware to PyLabRobot: https://github.com/PyLabRobot/pylabrobot/issues"
+    )
+    assert (
+      78.125 <= acceleration <= 781.25
+    ), "acceleration must be between 78.125 and 781.25 mm/sec**2"
+    assert isinstance(current_protection_limiter, int) and (
+      0 <= current_protection_limiter <= 15
+    ), "current_protection_limiter must be an integer between 0 and 15"
+
+    # Convert mm-based parameters to hardware increments using conversion methods
+    y_increment = self._head96_y_drive_mm_to_increment(y)
+    speed_increment = self._head96_y_drive_mm_to_increment(speed)
+    acceleration_increment = self._head96_y_drive_mm_to_increment(acceleration)
+
+    resp = await self.send_command(
+      module="H0",
+      command="YA",
+      ya=f"{y_increment:05}",
+      yv=f"{speed_increment:05}",
+      yr=f"{acceleration_increment:05}",
+      yw=f"{current_protection_limiter:02}",
+    )
+
+    return resp
+
+  async def head96_move_z(
+    self,
+    z: float,
+    speed: float = 80.0,
+    acceleration: float = 300.0,
+    current_protection_limiter: int = 15,
+  ):
+    """Move the 96-head to a specified Z-axis coordinate.
+
+    Args:
+      z: Target Z coordinate in mm. Valid range: [180.5, 342.5]
+      speed: Movement speed in mm/sec. Valid range: [0.25, 100.0]. Default: 80.0
+      acceleration: Movement acceleration in mm/sec^2. Valid range: [25.0, 500.0]. Default: 300.0
+      current_protection_limiter: Motor current limit (0-15, hardware units). Default: 15
+
+    Returns:
+      Response from the hardware command.
+
+    Raises:
+      AssertionError: If 96-head not installed, firmware info missing, or parameters out of range.
+
+    Note:
+      Firmware versions from 2021+ use 1:1 acceleration scaling, while pre-2021 versions
+      use 100x scaling. Both maintain a 100,000 increment upper limit.
+    """
+    # Validate 96-head installation and firmware info availability
+    assert self.core96_head_installed, "requires 96-head to be installed"
+    assert (
+      self._head96_information is not None
+    ), "requires 96-head firmware version information for safe operation"
+
+    fw_version = self._head96_information.fw_version
+
+    # Validate parameters before hardware communication
+    assert 180.5 <= z <= 342.5, "z must be between 180.5 and 342.5 mm"
+    assert 0.25 <= speed <= 100.0, "speed must be between 0.25 and 100.0 mm/sec"
+    assert 25.0 <= acceleration <= 500.0, "acceleration must be between 25.0 and 500.0 mm/sec**2"
+    assert isinstance(current_protection_limiter, int) and (
+      0 <= current_protection_limiter <= 15
+    ), "current_protection_limiter must be an integer between 0 and 15"
+
+    # Determine acceleration scaling based on firmware version
+    # Pre-2010 firmware: acceleration parameter is multiplied by 1000
+    # 2010+ firmware: acceleration parameter is 1:1 with increment/sec**2
+    # TODO: identify exact firmware version that introduced this change
+    acceleration_multiplier = 1 if fw_version.year >= 2010 else 0.001
+
+    # Convert mm-based parameters to hardware increments
+    z_increment = self._head96_z_drive_mm_to_increment(z)
+    speed_increment = self._head96_z_drive_mm_to_increment(speed)
+    acceleration_increment = round(
+      self._head96_z_drive_mm_to_increment(acceleration) * acceleration_multiplier
+    )
+
+    resp = await self.send_command(
+      module="H0",
+      command="ZA",
+      za=f"{z_increment:05}",
+      zv=f"{speed_increment:05}",
+      zr=f"{acceleration_increment:06}",
+      zw=f"{current_protection_limiter:02}",
+    )
+
+    return resp
 
   # -------------- 3.10.2 Tip handling using CoRe 96 Head --------------
 
@@ -5382,16 +6918,16 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
     x_direction: int = 0,
     y_positions: int = 0,
     minimum_traverse_height_at_beginning_of_a_command: int = 3425,
-    minimal_end_height: int = 3425,
+    min_z_endpos: int = 3425,
     lld_search_height: int = 3425,
-    liquid_surface_at_function_without_lld: int = 3425,
-    pull_out_distance_to_take_transport_air_in_function_without_lld: int = 50,
-    maximum_immersion_depth: int = 3425,
-    tube_2nd_section_height_measured_from_zm: int = 0,
-    tube_2nd_section_ratio: int = 3425,
+    liquid_surface_no_lld: int = 3425,
+    pull_out_distance_transport_air: int = 3425,
+    minimum_height: int = 3425,
+    second_section_height: int = 0,
+    second_section_ratio: int = 3425,
     immersion_depth: int = 0,
     immersion_depth_direction: int = 0,
-    liquid_surface_sink_distance_at_the_end_of_aspiration: int = 0,
+    surface_following_distance: float = 0,
     aspiration_volumes: int = 0,
     aspiration_speed: int = 1000,
     transport_air_volume: int = 0,
@@ -5404,12 +6940,22 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
     mix_volume: int = 0,
     mix_cycles: int = 0,
     mix_position_from_liquid_surface: int = 250,
-    surface_following_distance_during_mix: int = 0,
+    mix_surface_following_distance: int = 0,
     speed_of_mix: int = 1000,
     channel_pattern: List[bool] = [True] * 96,
     limit_curve_index: int = 0,
     tadm_algorithm: bool = False,
     recording_mode: int = 0,
+    # Deprecated parameters, to be removed in future versions
+    # rm: >2026-01:
+    liquid_surface_sink_distance_at_the_end_of_aspiration: float = 0,
+    minimal_end_height: int = 3425,
+    liquid_surface_at_function_without_lld: int = 3425,
+    pull_out_distance_to_take_transport_air_in_function_without_lld: int = 50,
+    maximum_immersion_depth: int = 3425,
+    surface_following_distance_during_mix: int = 0,
+    tube_2nd_section_ratio: int = 3425,
+    tube_2nd_section_height_measured_from_zm: int = 0,
   ):
     """aspirate CoRe 96
 
@@ -5424,24 +6970,19 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
       minimum_traverse_height_at_beginning_of_a_command: Minimum traverse height at beginning of
           a command 0.1mm] (refers to all channels independent of tip pattern parameter 'tm').
           Must be between 0 and 3425. Default 3425.
-      minimal_end_height: Minimal height at command end [0.1mm]. Must be between 0 and 3425.
-          Default 3425.
+      min_z_endpos: Minimal height at command end [0.1mm]. Must be between 0 and 3425. Default 3425.
       lld_search_height: LLD search height [0.1mm]. Must be between 0 and 3425. Default 3425.
-      liquid_surface_at_function_without_lld: Liquid surface at function without LLD [0.1mm].
-          Must be between 0 and 3425. Default 3425.
-      pull_out_distance_to_take_transport_air_in_function_without_lld: pull out distance to take
-          transport air in function without LLD [0.1mm]. Must be between 0 and 3425. Default 50.
-      maximum_immersion_depth: Minimum height (maximum immersion depth) [0.1mm]. Must be between
-          0 and 3425. Default 3425.
-      tube_2nd_section_height_measured_from_zm: Tube 2nd section height measured from "zm" [0.1mm]
-           Must be between 0 and 3425. Default 0.
-      tube_2nd_section_ratio: Tube 2nd section ratio (See Fig 2.). Must be between 0 and 10000.
-          Default 3425.
+      liquid_surface_no_lld: Liquid surface at function without LLD [0.1mm]. Must be between 0 and 3425. Default 3425.
+      pull_out_distance_transport_air: pull out distance to take transport air in function without LLD [0.1mm]. Must be between 0 and 3425. Default 50.
+      minimum_height: Minimum height (maximum immersion depth) [0.1mm]. Must be between 0 and 3425. Default 3425.
+      second_section_height: second ratio height. Must be between 0 and 3425. Default 0.
+      second_section_ratio: Tube 2nd section ratio (See Fig 2.). Must be between 0 and 10000. Default 3425.
       immersion_depth: Immersion depth [0.1mm]. Must be between 0 and 3600. Default 0.
       immersion_depth_direction: Direction of immersion depth (0 = go deeper, 1 = go up out of
           liquid). Must be between 0 and 1. Default 0.
-      liquid_surface_sink_distance_at_the_end_of_aspiration: Liquid surface sink distance at
-          the end of aspiration [0.1mm]. Must be between 0 and 990. Default 0.
+      surface_following_distance_at_the_end_of_aspiration: Surface following distance during
+          aspiration [0.1mm]. Must be between 0 and 990. Default 0. (renamed for clarity from
+          'liquid_surface_sink_distance_at_the_end_of_aspiration' in firmware docs)
       aspiration_volumes: Aspiration volume [0.1ul]. Must be between 0 and 11500. Default 0.
       aspiration_speed: Aspiration speed [0.1ul/s]. Must be between 3 and 5000. Default 1000.
       transport_air_volume: Transport air volume [0.1ul]. Must be between 0 and 500. Default 0.
@@ -5457,7 +6998,7 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
       mix_cycles: Number of mix cycles. Must be between 0 and 99. Default 0.
       mix_position_from_liquid_surface: mix position in Z- direction from
           liquid surface (LLD or absolute terms) [0.1mm]. Must be between 0 and 990. Default 250.
-      surface_following_distance_during_mix: surface following distance during
+      mix_surface_following_distance: surface following distance during
           mix [0.1mm]. Must be between 0 and 990. Default 0.
       speed_of_mix: Speed of mix [0.1ul/s]. Must be between 3 and 5000.
           Default 1000.
@@ -5468,6 +7009,84 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
           Must be between 0 and 2. Default 0.
     """
 
+    # # # TODO: delete > 2026-01 # # #
+    # deprecated liquid_surface_sink_distance_at_the_end_of_aspiration:
+    if liquid_surface_sink_distance_at_the_end_of_aspiration != 0.0:
+      surface_following_distance = liquid_surface_sink_distance_at_the_end_of_aspiration
+      warnings.warn(
+        "The liquid_surface_sink_distance_at_the_end_of_aspiration parameter is deprecated and will be removed in the future. "
+        "Use the Hamilton-standard surface_following_distance parameter instead.\n"
+        "liquid_surface_sink_distance_at_the_end_of_aspiration currently superseding "
+        "surface_following_distance.",
+        DeprecationWarning,
+      )
+
+    if minimal_end_height != 3425:
+      min_z_endpos = minimal_end_height
+      warnings.warn(
+        "The minimal_end_height parameter is deprecated and will be removed in the future. "
+        "Use the Hamilton-standard min_z_endpos parameter instead.\n"
+        "minimal_end_height currently superseding min_z_endpos.",
+        DeprecationWarning,
+      )
+
+    if liquid_surface_at_function_without_lld != 3425:
+      liquid_surface_no_lld = liquid_surface_at_function_without_lld
+      warnings.warn(
+        "The liquid_surface_at_function_without_lld parameter is deprecated and will be removed in the future. "
+        "Use the Hamilton-standard liquid_surface_no_lld parameter instead.\n"
+        "liquid_surface_at_function_without_lld currently superseding liquid_surface_no_lld.",
+        DeprecationWarning,
+      )
+
+    if pull_out_distance_to_take_transport_air_in_function_without_lld != 50:
+      pull_out_distance_transport_air = (
+        pull_out_distance_to_take_transport_air_in_function_without_lld
+      )
+      warnings.warn(
+        "The pull_out_distance_to_take_transport_air_in_function_without_lld parameter is deprecated and will be removed in the future. "
+        "Use the Hamilton-standard pull_out_distance_transport_air parameter instead.\n"
+        "pull_out_distance_to_take_transport_air_in_function_without_lld currently superseding pull_out_distance_transport_air.",
+        DeprecationWarning,
+      )
+
+    if maximum_immersion_depth != 3425:
+      minimum_height = maximum_immersion_depth
+      warnings.warn(
+        "The maximum_immersion_depth parameter is deprecated and will be removed in the future. "
+        "Use the Hamilton-standard minimum_height parameter instead.\n"
+        "minimum_height currently superseding maximum_immersion_depth.",
+        DeprecationWarning,
+      )
+
+    if surface_following_distance_during_mix != 0:
+      mix_surface_following_distance = surface_following_distance_during_mix
+      warnings.warn(
+        "The surface_following_distance_during_mix parameter is deprecated and will be removed in the future. "
+        "Use the Hamilton-standard mix_surface_following_distance parameter instead.\n"
+        "surface_following_distance_during_mix currently superseding mix_surface_following_distance.",
+        DeprecationWarning,
+      )
+
+    if tube_2nd_section_ratio != 3425:
+      second_section_ratio = tube_2nd_section_ratio
+      warnings.warn(
+        "The tube_2nd_section_ratio parameter is deprecated and will be removed in the future. "
+        "Use the Hamilton-standard second_section_ratio parameter instead.\n"
+        "tube_2nd_section_ratio currently superseding second_section_ratio.",
+        DeprecationWarning,
+      )
+
+    if tube_2nd_section_height_measured_from_zm != 0:
+      second_section_height = tube_2nd_section_height_measured_from_zm
+      warnings.warn(
+        "The tube_2nd_section_height_measured_from_zm parameter is deprecated and will be removed in the future. "
+        "Use the Hamilton-standard tube_2nd_section_height_measured_from_zm parameter instead.\n"
+        "tube_2nd_section_height_measured_from_zm currently superseding tube_2nd_section_height_measured_from_zm.",
+        DeprecationWarning,
+      )
+    # # # delete # # #
+
     assert 0 <= aspiration_type <= 2, "aspiration_type must be between 0 and 2"
     assert 0 <= x_position <= 30000, "x_position must be between 0 and 30000"
     assert 0 <= x_direction <= 1, "x_direction must be between 0 and 1"
@@ -5475,28 +7094,20 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
     assert (
       0 <= minimum_traverse_height_at_beginning_of_a_command <= 3425
     ), "minimum_traverse_height_at_beginning_of_a_command must be between 0 and 3425"
-    assert 0 <= minimal_end_height <= 3425, "minimal_end_height must be between 0 and 3425"
+    assert 0 <= min_z_endpos <= 3425, "min_z_endpos must be between 0 and 3425"
     assert 0 <= lld_search_height <= 3425, "lld_search_height must be between 0 and 3425"
+    assert 0 <= liquid_surface_no_lld <= 3425, "liquid_surface_no_lld must be between 0 and 3425"
     assert (
-      0 <= liquid_surface_at_function_without_lld <= 3425
-    ), "liquid_surface_at_function_without_lld must be between 0 and 3425"
-    assert (
-      0 <= pull_out_distance_to_take_transport_air_in_function_without_lld <= 3425
-    ), "pull_out_distance_to_take_transport_air_in_function_without_lld must be between 0 and 3425"
-    assert (
-      0 <= maximum_immersion_depth <= 3425
-    ), "maximum_immersion_depth must be between 0 and 3425"
-    assert (
-      0 <= tube_2nd_section_height_measured_from_zm <= 3425
-    ), "tube_2nd_section_height_measured_from_zm must be between 0 and 3425"
-    assert (
-      0 <= tube_2nd_section_ratio <= 10000
-    ), "tube_2nd_section_ratio must be between 0 and 10000"
+      0 <= pull_out_distance_transport_air <= 3425
+    ), "pull_out_distance_transport_air must be between 0 and 3425"
+    assert 0 <= minimum_height <= 3425, "minimum_height must be between 0 and 3425"
+    assert 0 <= second_section_height <= 3425, "second_section_height must be between 0 and 3425"
+    assert 0 <= second_section_ratio <= 10000, "second_section_ratio must be between 0 and 10000"
     assert 0 <= immersion_depth <= 3600, "immersion_depth must be between 0 and 3600"
     assert 0 <= immersion_depth_direction <= 1, "immersion_depth_direction must be between 0 and 1"
     assert (
-      0 <= liquid_surface_sink_distance_at_the_end_of_aspiration <= 990
-    ), "liquid_surface_sink_distance_at_the_end_of_aspiration must be between 0 and 990"
+      0 <= surface_following_distance <= 990
+    ), "surface_following_distance must be between 0 and 990"
     assert 0 <= aspiration_volumes <= 11500, "aspiration_volumes must be between 0 and 11500"
     assert 3 <= aspiration_speed <= 5000, "aspiration_speed must be between 3 and 5000"
     assert 0 <= transport_air_volume <= 500, "transport_air_volume must be between 0 and 500"
@@ -5512,8 +7123,8 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
       0 <= mix_position_from_liquid_surface <= 990
     ), "mix_position_from_liquid_surface must be between 0 and 990"
     assert (
-      0 <= surface_following_distance_during_mix <= 990
-    ), "surface_following_distance_during_mix must be between 0 and 990"
+      0 <= mix_surface_following_distance <= 990
+    ), "mix_surface_following_distance must be between 0 and 990"
     assert 3 <= speed_of_mix <= 5000, "speed_of_mix must be between 3 and 5000"
     assert 0 <= limit_curve_index <= 999, "limit_curve_index must be between 0 and 999"
 
@@ -5532,16 +7143,16 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
       xd=x_direction,
       yh=f"{y_positions:04}",
       zh=f"{minimum_traverse_height_at_beginning_of_a_command:04}",
-      ze=f"{minimal_end_height:04}",
+      ze=f"{min_z_endpos:04}",
       lz=f"{lld_search_height:04}",
-      zt=f"{liquid_surface_at_function_without_lld:04}",
-      pp=f"{pull_out_distance_to_take_transport_air_in_function_without_lld:04}",
-      zm=f"{maximum_immersion_depth:04}",
-      zv=f"{tube_2nd_section_height_measured_from_zm:04}",
-      zq=f"{tube_2nd_section_ratio:05}",
+      zt=f"{liquid_surface_no_lld:04}",
+      pp=f"{pull_out_distance_transport_air:04}",
+      zm=f"{minimum_height:04}",
+      zv=f"{second_section_height:04}",
+      zq=f"{second_section_ratio:05}",
       iw=f"{immersion_depth:03}",
       ix=immersion_depth_direction,
-      fh=f"{liquid_surface_sink_distance_at_the_end_of_aspiration:03}",
+      fh=f"{surface_following_distance:03}",
       af=f"{aspiration_volumes:05}",
       ag=f"{aspiration_speed:04}",
       vt=f"{transport_air_volume:03}",
@@ -5554,7 +7165,7 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
       hv=f"{mix_volume:05}",
       hc=f"{mix_cycles:02}",
       hp=f"{mix_position_from_liquid_surface:03}",
-      mj=f"{surface_following_distance_during_mix:03}",
+      mj=f"{mix_surface_following_distance:03}",
       hs=f"{speed_of_mix:04}",
       cw=channel_pattern_hex,
       cr=f"{limit_curve_index:03}",
@@ -5569,17 +7180,17 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
     x_position: int = 0,
     x_direction: int = 0,
     y_position: int = 0,
-    tube_2nd_section_height_measured_from_zm: int = 0,
-    tube_2nd_section_ratio: int = 3425,
+    second_section_height: int = 0,
+    second_section_ratio: int = 3425,
     lld_search_height: int = 3425,
-    liquid_surface_at_function_without_lld: int = 3425,
-    pull_out_distance_to_take_transport_air_in_function_without_lld: int = 50,
-    maximum_immersion_depth: int = 3425,
+    liquid_surface_no_lld: int = 3425,
+    pull_out_distance_transport_air: int = 50,
+    minimum_height: int = 3425,
     immersion_depth: int = 0,
     immersion_depth_direction: int = 0,
-    liquid_surface_sink_distance_at_the_end_of_dispense: int = 0,
+    surface_following_distance: float = 0,
     minimum_traverse_height_at_beginning_of_a_command: int = 3425,
-    minimal_end_height: int = 3425,
+    min_z_endpos: int = 3425,
     dispense_volume: int = 0,
     dispense_speed: int = 5000,
     cut_off_speed: int = 250,
@@ -5593,17 +7204,26 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
     settling_time: int = 5,
     mixing_volume: int = 0,
     mixing_cycles: int = 0,
-    mixing_position_from_liquid_surface: int = 250,
-    surface_following_distance_during_mixing: int = 0,
+    mix_position_from_liquid_surface: int = 250,
+    mix_surface_following_distance: int = 0,
     speed_of_mixing: int = 1000,
     channel_pattern: List[bool] = [True] * 12 * 8,
     limit_curve_index: int = 0,
     tadm_algorithm: bool = False,
     recording_mode: int = 0,
+    # Deprecated parameters, to be removed in future versions
+    # rm: >2026-01:
+    liquid_surface_sink_distance_at_the_end_of_dispense: float = 0,  # surface_following_distance!
+    tube_2nd_section_ratio: int = 3425,
+    liquid_surface_at_function_without_lld: int = 3425,
+    maximum_immersion_depth: int = 3425,
+    minimal_end_height: int = 3425,
+    mixing_position_from_liquid_surface: int = 250,
+    surface_following_distance_during_mixing: int = 0,
+    pull_out_distance_to_take_transport_air_in_function_without_lld: int = 50,
+    tube_2nd_section_height_measured_from_zm: int = 0,
   ):
-    """dispense CoRe 96
-
-    Dispensing of liquid using CoRe 96
+    """Dispensing of liquid using CoRe 96
 
     Args:
       dispensing_mode: Type of dispensing mode 0 = Partial volume in jet mode 1 = Blow out
@@ -5612,26 +7232,21 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
       x_position: X-Position [0.1mm] of well A1. Must be between 0 and 30000. Default 0.
       x_direction: X-direction. 0 = positive 1 = negative. Must be between 0 and 1. Default 0.
       y_position: Y-Position [0.1mm] of well A1. Must be between 1080 and 5600. Default 0.
-      maximum_immersion_depth: Minimum height (maximum immersion depth) [0.1mm]. Must be between
-          0 and 3425. Default 3425.
-      tube_2nd_section_height_measured_from_zm: Tube 2nd section height measured from
-          "zm" [0.1mm]. Must be between 0 and 3425. Default 0.
-      tube_2nd_section_ratio: Tube 2nd section ratio (See Fig 2.). Must be between 0 and 10000.
-          Default 3425.
+      minimum_height: Minimum height (maximum immersion depth) [0.1mm]. Must be between 0 and 3425. Default 3425.
+      second_section_height: Second ratio height. [0.1mm]. Must be between 0 and 3425. Default 0.
+      second_section_ratio: Tube 2nd section ratio (See Fig 2.). Must be between 0 and 10000. Default 3425.
       lld_search_height: LLD search height [0.1mm]. Must be between 0 and 3425. Default 3425.
-      liquid_surface_at_function_without_lld: Liquid surface at function without LLD [0.1mm].
-          Must be between 0 and 3425. Default 3425.
-      pull_out_distance_to_take_transport_air_in_function_without_lld: pull out distance to take
-          transport air in function without LLD [0.1mm]. Must be between 0 and 3425. Default 50.
+      liquid_surface_no_lld: Liquid surface at function without LLD [0.1mm]. Must be between 0 and 3425. Default 3425.
+      pull_out_distance_transport_air: pull out distance to take transport air in function without LLD [0.1mm]. Must be between 0 and 3425. Default 50.
       immersion_depth: Immersion depth [0.1mm]. Must be between 0 and 3600. Default 0.
       immersion_depth_direction: Direction of immersion depth (0 = go deeper, 1 = go up out of
           liquid). Must be between 0 and 1. Default 0.
-      liquid_surface_sink_distance_at_the_end_of_dispense: Liquid surface sink elevation at
-          the end of aspiration [0.1mm]. Must be between 0 and 990. Default 0.
+      surface_following_distance: Liquid surface following distance during dispense [0.1mm].
+          Must be between 0 and 990. Default 0. (renamed for clarity from
+          'liquid_surface_sink_distance_at_the_end_of_dispense' in firmware docs)
       minimum_traverse_height_at_beginning_of_a_command: Minimal traverse height at begin of
           command [0.1mm]. Must be between 0 and 3425. Default 3425.
-      minimal_end_height: Minimal height at command end [0.1mm]. Must be between 0 and 3425.
-          Default 3425.
+      min_z_endpos: Minimal height at command end [0.1mm]. Must be between 0 and 3425. Default 3425.
       dispense_volume: Dispense volume [0.1ul]. Must be between 0 and 11500. Default 0.
       dispense_speed: Dispense speed [0.1ul/s]. Must be between 3 and 5000. Default 5000.
       cut_off_speed: Cut-off speed [0.1ul/s]. Must be between 3 and 5000. Default 250.
@@ -5648,10 +7263,8 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
       settling_time: Settling time [0.1s]. Must be between 0 and 99. Default 5.
       mixing_volume: mix volume [0.1ul]. Must be between 0 and 11500. Default 0.
       mixing_cycles: Number of mixing cycles. Must be between 0 and 99. Default 0.
-      mixing_position_from_liquid_surface: mix position in Z- direction from liquid
-          surface (LLD or absolute terms) [0.1mm]. Must be between 0 and 990. Default 250.
-      surface_following_distance_during_mixing: surface following distance during mixing [0.1mm].
-          Must be between 0 and 990. Default 0.
+      mix_position_from_liquid_surface: mix position in Z- direction from liquid surface (LLD or absolute terms) [0.1mm]. Must be between 0 and 990. Default 250.
+      mix_surface_following_distance: surface following distance during mixing [0.1mm].  Must be between 0 and 990. Default 0.
       speed_of_mixing: Speed of mixing [0.1ul/s]. Must be between 3 and 5000. Default 1000.
       channel_pattern: list of 96 boolean values
       limit_curve_index: limit curve index. Must be between 0 and 999. Default 0.
@@ -5660,35 +7273,113 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
           be between 0 and 2. Default 0.
     """
 
+    # # # TODO: delete > 2026-01 # # #
+    # deprecated liquid_surface_sink_distance_at_the_end_of_aspiration:
+    if liquid_surface_sink_distance_at_the_end_of_dispense != 0.0:
+      surface_following_distance = liquid_surface_sink_distance_at_the_end_of_dispense
+      warnings.warn(
+        "The liquid_surface_sink_distance_at_the_end_of_dispense parameter is deprecated and will be removed in the future. "
+        "Use the Hamilton-standard surface_following_distance parameter instead.\n"
+        "liquid_surface_sink_distance_at_the_end_of_dispense currently superseding surface_following_distance.",
+        DeprecationWarning,
+      )
+
+    if tube_2nd_section_ratio != 3425:
+      second_section_ratio = tube_2nd_section_ratio
+      warnings.warn(
+        "The tube_2nd_section_ratio parameter is deprecated and will be removed in the future. "
+        "Use the Hamilton-standard second_section_ratio parameter instead.\n"
+        "second_section_ratio currently superseding tube_2nd_section_ratio.",
+        DeprecationWarning,
+      )
+
+    if maximum_immersion_depth != 3425:
+      minimum_height = maximum_immersion_depth
+      warnings.warn(
+        "The maximum_immersion_depth parameter is deprecated and will be removed in the future. "
+        "Use the Hamilton-standard minimum_height parameter instead.\n"
+        "minimum_height currently superseding maximum_immersion_depth.",
+        DeprecationWarning,
+      )
+
+    if liquid_surface_at_function_without_lld != 3425:
+      liquid_surface_no_lld = liquid_surface_at_function_without_lld
+      warnings.warn(
+        "The liquid_surface_at_function_without_lld parameter is deprecated and will be removed in the future. "
+        "Use the Hamilton-standard liquid_surface_no_lld parameter instead.\n"
+        "liquid_surface_at_function_without_lld currently superseding liquid_surface_no_lld.",
+        DeprecationWarning,
+      )
+
+    if minimal_end_height != 3425:
+      min_z_endpos = minimal_end_height
+      warnings.warn(
+        "The minimal_end_height parameter is deprecated and will be removed in the future. "
+        "Use the Hamilton-standard min_z_endpos parameter instead.\n"
+        "minimal_end_height currently superseding min_z_endpos.",
+        DeprecationWarning,
+      )
+
+    if mixing_position_from_liquid_surface != 250:
+      mix_position_from_liquid_surface = mixing_position_from_liquid_surface
+      warnings.warn(
+        "The mixing_position_from_liquid_surface parameter is deprecated and will be removed in the future. "
+        "Use the Hamilton-standard mix_position_from_liquid_surface parameter instead.\n"
+        "mixing_position_from_liquid_surface currently superseding mix_position_from_liquid_surface.",
+        DeprecationWarning,
+      )
+
+    if surface_following_distance_during_mixing != 0:
+      mix_surface_following_distance = surface_following_distance_during_mixing
+      warnings.warn(
+        "The surface_following_distance_during_mixing parameter is deprecated and will be removed in the future. "
+        "Use the Hamilton-standard mix_surface_following_distance parameter instead.\n"
+        "mix_surface_following_distance currently superseding surface_following_distance_during_mixing.",
+        DeprecationWarning,
+      )
+
+    if pull_out_distance_to_take_transport_air_in_function_without_lld != 50:
+      pull_out_distance_transport_air = (
+        pull_out_distance_to_take_transport_air_in_function_without_lld
+      )
+      warnings.warn(
+        "The pull_out_distance_to_take_transport_air_in_function_without_lld parameter is deprecated and will be removed in the future. "
+        "Use the Hamilton-standard pull_out_distance_transport_air parameter instead.\n"
+        "pull_out_distance_to_take_transport_air_in_function_without_lld currently superseding pull_out_distance_transport_air.",
+        DeprecationWarning,
+      )
+
+    if tube_2nd_section_height_measured_from_zm != 0:
+      second_section_height = tube_2nd_section_height_measured_from_zm
+      warnings.warn(
+        "The tube_2nd_section_height_measured_from_zm parameter is deprecated and will be removed in the future. "
+        "Use the Hamilton-standard second_section_height parameter instead.\n"
+        "tube_2nd_section_height_measured_from_zm currently superseding second_section_height.",
+        DeprecationWarning,
+      )
+    # # # delete # # #
+
     assert 0 <= dispensing_mode <= 4, "dispensing_mode must be between 0 and 4"
     assert 0 <= x_position <= 30000, "x_position must be between 0 and 30000"
     assert 0 <= x_direction <= 1, "x_direction must be between 0 and 1"
     assert 1080 <= y_position <= 5600, "y_position must be between 1080 and 5600"
-    assert (
-      0 <= maximum_immersion_depth <= 3425
-    ), "maximum_immersion_depth must be between 0 and 3425"
-    assert (
-      0 <= tube_2nd_section_height_measured_from_zm <= 3425
-    ), "tube_2nd_section_height_measured_from_zm must be between 0 and 3425"
-    assert (
-      0 <= tube_2nd_section_ratio <= 10000
-    ), "tube_2nd_section_ratio must be between 0 and 10000"
+    assert 0 <= minimum_height <= 3425, "minimum_height must be between 0 and 3425"
+    assert 0 <= second_section_height <= 3425, "second_section_height must be between 0 and 3425"
+    assert 0 <= second_section_ratio <= 10000, "second_section_ratio must be between 0 and 10000"
     assert 0 <= lld_search_height <= 3425, "lld_search_height must be between 0 and 3425"
+    assert 0 <= liquid_surface_no_lld <= 3425, "liquid_surface_no_lld must be between 0 and 3425"
     assert (
-      0 <= liquid_surface_at_function_without_lld <= 3425
-    ), "liquid_surface_at_function_without_lld must be between 0 and 3425"
-    assert (
-      0 <= pull_out_distance_to_take_transport_air_in_function_without_lld <= 3425
-    ), "pull_out_distance_to_take_transport_air_in_function_without_lld must be between 0 and 3425"
+      0 <= pull_out_distance_transport_air <= 3425
+    ), "pull_out_distance_transport_air must be between 0 and 3425"
     assert 0 <= immersion_depth <= 3600, "immersion_depth must be between 0 and 3600"
     assert 0 <= immersion_depth_direction <= 1, "immersion_depth_direction must be between 0 and 1"
     assert (
-      0 <= liquid_surface_sink_distance_at_the_end_of_dispense <= 990
-    ), "liquid_surface_sink_distance_at_the_end_of_dispense must be between 0 and 990"
+      0 <= surface_following_distance <= 990
+    ), "surface_following_distance must be between 0 and 990"
     assert (
       0 <= minimum_traverse_height_at_beginning_of_a_command <= 3425
     ), "minimum_traverse_height_at_beginning_of_a_command must be between 0 and 3425"
-    assert 0 <= minimal_end_height <= 3425, "minimal_end_height must be between 0 and 3425"
+    assert 0 <= min_z_endpos <= 3425, "min_z_endpos must be between 0 and 3425"
     assert 0 <= dispense_volume <= 11500, "dispense_volume must be between 0 and 11500"
     assert 3 <= dispense_speed <= 5000, "dispense_speed must be between 3 and 5000"
     assert 3 <= cut_off_speed <= 5000, "cut_off_speed must be between 3 and 5000"
@@ -5703,11 +7394,11 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
     assert 0 <= mixing_volume <= 11500, "mixing_volume must be between 0 and 11500"
     assert 0 <= mixing_cycles <= 99, "mixing_cycles must be between 0 and 99"
     assert (
-      0 <= mixing_position_from_liquid_surface <= 990
-    ), "mixing_position_from_liquid_surface must be between 0 and 990"
+      0 <= mix_position_from_liquid_surface <= 990
+    ), "mix_position_from_liquid_surface must be between 0 and 990"
     assert (
-      0 <= surface_following_distance_during_mixing <= 990
-    ), "surface_following_distance_during_mixing must be between 0 and 990"
+      0 <= mix_surface_following_distance <= 990
+    ), "mix_surface_following_distance must be between 0 and 990"
     assert 3 <= speed_of_mixing <= 5000, "speed_of_mixing must be between 3 and 5000"
     assert 0 <= limit_curve_index <= 999, "limit_curve_index must be between 0 and 999"
     assert 0 <= recording_mode <= 2, "recording_mode must be between 0 and 2"
@@ -5724,17 +7415,17 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
       xs=f"{x_position:05}",
       xd=x_direction,
       yh=f"{y_position:04}",
-      zm=f"{maximum_immersion_depth:04}",
-      zv=f"{tube_2nd_section_height_measured_from_zm:04}",
-      zq=f"{tube_2nd_section_ratio:05}",
+      zm=f"{minimum_height:04}",
+      zv=f"{second_section_height:04}",
+      zq=f"{second_section_ratio:05}",
       lz=f"{lld_search_height:04}",
-      zt=f"{liquid_surface_at_function_without_lld:04}",
-      pp=f"{pull_out_distance_to_take_transport_air_in_function_without_lld:04}",
+      zt=f"{liquid_surface_no_lld:04}",
+      pp=f"{pull_out_distance_transport_air:04}",
       iw=f"{immersion_depth:03}",
       ix=immersion_depth_direction,
-      fh=f"{liquid_surface_sink_distance_at_the_end_of_dispense:03}",
+      fh=f"{surface_following_distance:03}",
       zh=f"{minimum_traverse_height_at_beginning_of_a_command:04}",
-      ze=f"{minimal_end_height:04}",
+      ze=f"{min_z_endpos:04}",
       df=f"{dispense_volume:05}",
       dg=f"{dispense_speed:04}",
       es=f"{cut_off_speed:04}",
@@ -5748,8 +7439,8 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
       wh=f"{settling_time:02}",
       hv=f"{mixing_volume:05}",
       hc=f"{mixing_cycles:02}",
-      hp=f"{mixing_position_from_liquid_surface:03}",
-      mj=f"{surface_following_distance_during_mixing:03}",
+      hp=f"{mix_position_from_liquid_surface:03}",
+      mj=f"{mix_surface_following_distance:03}",
       hs=f"{speed_of_mixing:04}",
       cw=channel_pattern_hex,
       cr=f"{limit_curve_index:03}",
@@ -5761,15 +7452,15 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
 
   async def move_core_96_head_to_defined_position(
     self,
-    x: float = 0,
-    y: float = 0,
-    z: float = 0,
+    x: float,
+    y: float,
+    z: float = 342.5,
     minimum_height_at_beginning_of_a_command: float = 342.5,
   ):
     """Move CoRe 96 Head to defined position
 
     Args:
-      x: X-Position [1mm] of well A1. Must be between 0 and 3000.0. Default 0.
+      x: X-Position [1mm] of well A1. Must be between -300.0 and 300.0. Default 0.
       y: Y-Position [1mm]. Must be between 108.0 and 560.0. Default 0.
       z: Z-Position [1mm]. Must be between 0 and 560.0. Default 0.
       minimum_height_at_beginning_of_a_command: Minimum height at beginning of a command [1mm]
@@ -5777,51 +7468,162 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
         342.5. Default 342.5.
     """
 
-    assert 0 <= x <= 3000.0, "x_position must be between 0 and 30000"
-    assert 108.0 <= y <= 560.0, "y_position must be between 1080 and 5600"
-    assert 0 <= y <= 560.0, "z_position must be between 0 and 5600"
+    warnings.warn(  # TODO: remove 2025-02
+      "`move_core_96_head_to_defined_position` is deprecated and will be "
+      "removed in 2025-02. Use `head96_move_to_coordinate` instead.",
+      DeprecationWarning,
+      stacklevel=2,
+    )
+
+    # TODO: these are values for a STARBackend. Find them for a STARlet.
+    self._check_96_position_legal(Coordinate(x, y, z))
     assert (
       0 <= minimum_height_at_beginning_of_a_command <= 342.5
-    ), "minimum_height_at_beginning_of_a_command must be between 0 and 3425"
+    ), "minimum_height_at_beginning_of_a_command must be between 0 and 342.5"
 
     return await self.send_command(
       module="C0",
       command="EM",
-      xs=f"{round(x*10):05}",
+      xs=f"{abs(round(x*10)):05}",
       xd=0 if x >= 0 else 1,
       yh=f"{round(y*10):04}",
       za=f"{round(z*10):04}",
       zh=f"{round(minimum_height_at_beginning_of_a_command*10):04}",
     )
 
-  async def move_core_96_head_x(self, x_position: float):
-    """Move CoRe 96 Head X to absolute position"""
-    loc = await self.request_position_of_core_96_head()
-    await self.move_core_96_head_to_defined_position(
-      x=x_position,
-      y=loc["yh"],
-      z=loc["za"],
-      minimum_height_at_beginning_of_a_command=loc["za"] - 10,
+  async def head96_move_to_coordinate(
+    self,
+    coordinate: Coordinate,
+    minimum_height_at_beginning_of_a_command: float = 342.5,
+  ):
+    """Move STAR(let) 96-Head to defined Coordinate
+
+    Args:
+      coordinate: Coordinate of A1 in mm
+        - if tip present refers to tip bottom,
+        - if not present refers to channel bottom
+      minimum_height_at_beginning_of_a_command: Minimum height at beginning of a command [1mm]
+        (refers to all channels independent of tip pattern parameter 'tm'). Must be between ? and
+        342.5. Default 342.5.
+    """
+
+    self._check_96_position_legal(coordinate)
+
+    assert (
+      0 <= minimum_height_at_beginning_of_a_command <= 342.5
+    ), "minimum_height_at_beginning_of_a_command must be between 0 and 342.5"
+
+    return await self.send_command(
+      module="C0",
+      command="EM",
+      xs=f"{abs(round(coordinate.x*10)):05}",
+      xd="0" if coordinate.x >= 0 else "1",
+      yh=f"{round(coordinate.y*10):04}",
+      za=f"{round(coordinate.z*10):04}",
+      zh=f"{round(minimum_height_at_beginning_of_a_command*10):04}",
     )
+
+  async def head96_dispensing_drive_move_to_position(
+    self,
+    position,
+    speed: float = 261.1,
+    stop_speed: float = 0,
+    acceleration: float = 17406.84,
+    current_protection_limiter: int = 15,
+  ):
+    """Move dispensing drive to absolute position in uL
+
+    Args:
+      position: Position in uL. Between 0, 1244.59.
+      speed: Speed in uL/s. Between 0.1, 1063.75.
+      stop_speed: Stop speed in uL/s. Between 0, 1063.75.
+      acceleration: Acceleration in uL/s^2. Between 96.7, 17406.84.
+      current_protection_limiter: Current protection limiter (0-15), default 15
+    """
+
+    if not (0 <= position <= 1244.59):
+      raise ValueError("position must be between 0 and 1244.59")
+    if not (0.1 <= speed <= 1063.75):
+      raise ValueError("speed must be between 0.1 and 1063.75")
+    if not (0 <= stop_speed <= 1063.75):
+      raise ValueError("stop_speed must be between 0 and 1063.75")
+    if not (96.7 <= acceleration <= 17406.84):
+      raise ValueError("acceleration must be between 96.7 and 17406.84")
+    if not (0 <= current_protection_limiter <= 15):
+      raise ValueError("current_protection_limiter must be between 0 and 15")
+
+    position_increments = self._head96_dispensing_drive_uL_to_increment(position)
+    speed_increments = self._head96_dispensing_drive_uL_to_increment(speed)
+    stop_speed_increments = self._head96_dispensing_drive_uL_to_increment(stop_speed)
+    acceleration_increments = self._head96_dispensing_drive_uL_to_increment(acceleration)
+
+    await self.send_command(
+      module="H0",
+      command="DQ",
+      dq=f"{position_increments:05}",
+      dv=f"{speed_increments:05}",
+      du=f"{stop_speed_increments:05}",
+      dr=f"{acceleration_increments:06}",
+      dw=f"{current_protection_limiter:02}",
+    )
+
+  async def move_core_96_head_x(self, x_position: float):
+    """Move CoRe 96 Head X to absolute position
+
+    .. deprecated::
+      Use :meth:`head96_move_x` instead. Will be removed in 2026-06.
+    """
+    warnings.warn(
+      "`move_core_96_head_x` is deprecated. Use `head96_move_x` instead.",
+      DeprecationWarning,
+      stacklevel=2,
+    )
+    return await self.head96_move_x(x_position)
 
   async def move_core_96_head_y(self, y_position: float):
-    """Move CoRe 96 Head Y to absolute position"""
-    loc = await self.request_position_of_core_96_head()
-    await self.move_core_96_head_to_defined_position(
-      x=loc["xs"],
-      y=y_position,
-      z=loc["za"],
-      minimum_height_at_beginning_of_a_command=loc["za"],
+    """Move CoRe 96 Head Y to absolute position
+
+    .. deprecated::
+      Use :meth:`head96_move_y` instead. Will be removed in 2026-06.
+    """
+    warnings.warn(
+      "`move_core_96_head_y` is deprecated. Use `head96_move_y` instead.",
+      DeprecationWarning,
+      stacklevel=2,
     )
+    return await self.head96_move_y(y_position)
 
   async def move_core_96_head_z(self, z_position: float):
-    """Move CoRe 96 Head Z to absolute position"""
-    loc = await self.request_position_of_core_96_head()
-    await self.move_core_96_head_to_defined_position(
-      x=loc["xs"],
-      y=loc["yh"],
-      z=z_position,
-      minimum_height_at_beginning_of_a_command=loc["za"] - 10,
+    """Move CoRe 96 Head Z to absolute position
+
+    .. deprecated::
+      Use :meth:`head96_move_z` instead. Will be removed in 2026-06.
+    """
+    warnings.warn(
+      "`move_core_96_head_z` is deprecated. Use `head96_move_z` instead.",
+      DeprecationWarning,
+      stacklevel=2,
+    )
+    return await self.head96_move_z(z_position)
+
+  async def move_96head_to_coordinate(
+    self,
+    coordinate: Coordinate,
+    minimum_height_at_beginning_of_a_command: float = 342.5,
+  ):
+    """Move STAR(let) 96-Head to defined Coordinate
+
+    .. deprecated::
+      Use :meth:`head96_move_to_coordinate` instead. Will be removed in 2026-06.
+    """
+    warnings.warn(
+      "`move_96head_to_coordinate` is deprecated. Use `head96_move_to_coordinate` instead.",
+      DeprecationWarning,
+      stacklevel=2,
+    )
+    return await self.head96_move_to_coordinate(
+      coordinate=coordinate,
+      minimum_height_at_beginning_of_a_command=minimum_height_at_beginning_of_a_command,
     )
 
   # -------------- 3.10.5 Wash procedure commands using CoRe 96 Head --------------
@@ -5841,20 +7643,33 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
     return await self.send_command(module="C0", command="QH", fmt="qh#")
 
   async def request_position_of_core_96_head(self):
+    """Deprecated - use `head96_request_position` instead."""
+
+    warnings.warn(  # TODO: remove 2026-02
+      "`request_position_of_core_96_head` is deprecated and will be "
+      "removed in 2026-02 use `head96_request_position` instead.",
+      DeprecationWarning,
+      stacklevel=2,
+    )
+
+    return await self.head96_request_position()
+
+  async def head96_request_position(self) -> Coordinate:
     """Request position of CoRe 96 Head (A1 considered to tip length)
 
     Returns:
-      xs: A1 X direction [1mm]
-      xd: X direction 0 = positive 1 = negative
-      yh: A1 Y direction [1mm]
-      za: Z height [1mm]
+      Coordinate: x, y, z in mm
     """
 
     resp = await self.send_command(module="C0", command="QI", fmt="xs#####xd#yh####za####")
-    resp["xs"] = resp["xs"] / 10
-    resp["yh"] = resp["yh"] / 10
-    resp["za"] = resp["za"] / 10
-    return resp
+
+    x_coordinate = resp["xs"] / 10
+    y_coordinate = resp["yh"] / 10
+    z_coordinate = resp["za"] / 10
+
+    x_coordinate = x_coordinate if resp["xd"] == 0 else -x_coordinate
+
+    return Coordinate(x=x_coordinate, y=y_coordinate, z=z_coordinate)
 
   async def request_core_96_head_channel_tadm_status(self):
     """Request CoRe 96 Head channel TADM Status
@@ -5873,6 +7688,16 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
     """
 
     return await self.send_command(module="C0", command="VB", fmt="vb" + "&" * 24)
+
+  async def head96_dispensing_drive_request_position_mm(self) -> float:
+    """Request 96 Head dispensing drive position in mm"""
+    resp = await self.send_command(module="H0", command="RD", fmt="rd######")
+    return self._head96_dispensing_drive_increment_to_mm(resp["rd"])
+
+  async def head96_dispensing_drive_request_position_uL(self) -> float:
+    """Request 96 Head dispensing drive position in uL"""
+    position_mm = await self.head96_dispensing_drive_request_position_mm()
+    return self._head96_dispensing_drive_mm_to_uL(position_mm)
 
   # -------------- 3.11 384 Head commands --------------
 
@@ -5925,104 +7750,549 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
   # TODO:(command:RR)
   # TODO:(command:QU)
 
-  # -------------- 3.13 Auto load commands --------------
+  # -------------- 3.13 Autoload commands --------------
 
   # -------------- 3.13.1 Initialization --------------
 
   async def initialize_auto_load(self):
+    """Deprecated - use `initialize_autoload` instead."""
+    warnings.warn(  # TODO: remove 2025-02
+      "`initialize_auto_load` is deprecated and will be removed "
+      "in 2025-02 use  `initialize_autoload` instead.",
+      DeprecationWarning,
+      stacklevel=2,
+    )
+    return await self.initialize_autoload()
+
+  async def initialize_autoload(self):
     """Initialize Auto load module"""
 
     return await self.send_command(module="C0", command="II")
 
   async def move_auto_load_to_z_save_position(self):
-    """Move auto load to Z save position"""
+    """Deprecated - use `move_autoload_to_safe_z_position` instead."""
+
+    warnings.warn(  # TODO: remove 2025-02
+      "`move_auto_load_to_z_save_position` is deprecated and will be "
+      "removed in 2025-02 use `move_autoload_to_safe_z_position` instead.",
+      DeprecationWarning,
+      stacklevel=2,
+    )
+
+    return await self.move_autoload_to_safe_z_position()
+
+  async def move_autoload_to_save_z_position(self):
+    """Deprecated - use `move_autoload_to_safe_z_position` instead."""
+    warnings.warn(  # TODO: remove 2025-02
+      "`move_autoload_to_saVe_z_position` is deprecated and will be "
+      "removed in 2025-02 use `move_autoload_to_safe_z_position` instead.",
+      DeprecationWarning,
+      stacklevel=2,
+    )
+    return await self.move_autoload_to_safe_z_position()
+
+  async def move_autoload_to_safe_z_position(self):
+    """Move autoload carrier handling wheel to safe Z position"""
 
     return await self.send_command(module="C0", command="IV")
 
-  # -------------- 3.13.2 Carrier handling --------------
+  async def request_auto_load_slot_position(self):
+    """Deprecated - use `request_autoload_track` instead."""
+    warnings.warn(  # TODO: remove 2025-02
+      "`request_auto_load_slot_position` is deprecated and will be "
+      "removed in 2025-02 use `request_autoload_track` instead.",
+      DeprecationWarning,
+      stacklevel=2,
+    )
+    return await self.request_autoload_track()
 
-  # TODO:(command:CI) Identify carrier (determine carrier type)
-
-  async def request_single_carrier_presence(self, carrier_position: int):
-    """Request single carrier presence
-
-    Args:
-      carrier_position: Carrier position (slot number)
+  async def request_autoload_track(self) -> int:
+    """Request current track of the autoload 'carrier handler'.
 
     Returns:
-      True if present, False otherwise
+      track (0..54)
+    """
+    resp = await self.send_command(module="C0", command="QA", fmt="qa##")
+    return int(resp["qa"])
+
+  async def request_autoload_type(self) -> str:
+    """
+    Query the autoload module type.
+
+    This sends the `C0:QA` command, which returns a CQ-format response containing
+    the autoload identification fields, error/trace information, and the module
+    type code. The `cq` field specifies the autoload hardware type:
+
+        0 = ML-STAR with 1D Barcode Scanner
+        1 = XRP Lite
+        2 = ML-STAR with 2D Barcode Scanner
+        3-9 = Reserved / other module variants
+
+    Returns:
+        int: The autoload module type code (0-9).
     """
 
-    assert 1 <= carrier_position <= 54, "carrier_position must be between 1 and 54"
-    carrier_position_str = str(carrier_position).zfill(2)
+    autoload_type_dict = {
+      0: "ML-STAR with 1D Barcode Scanner",
+      1: "XRP Lite",
+      2: "ML-STAR with 2D Barcode Scanner",
+    }
+
+    resp = await self.send_command(module="C0", command="CQ", fmt="cq#")
+    resp = autoload_type_dict[resp["cq"]] if resp["cq"] in autoload_type_dict else resp["cq"]
+
+    return str(resp)
+
+  # -------------- 3.13.2 Carrier sensing --------------
+
+  def _decode_hex_bitmask_to_track_list(self, mask_hex: str) -> list[int]:
+    """
+    Decode a hex occupancy bitmask of arbitrary length.
+    Each hex nibble = 4 slots.
+    Slot numbering starts at 1 from the rightmost nibble (LSB).
+    """
+    mask_hex = mask_hex.strip()
+
+    if not all(c in "0123456789abcdefABCDEF" for c in mask_hex):
+      raise ValueError(f"Invalid hex in mask: {mask_hex!r}")
+
+    slots = []
+    bit_index = 1
+
+    # Rightmost hex digit = slot 1 (LSB)
+    for nibble in reversed(mask_hex):
+      val = int(nibble, 16)
+      for bit in range(4):
+        if val & (1 << bit):
+          slots.append(bit_index)
+        bit_index += 1
+
+    return sorted(slots)
+
+  async def request_presence_of_carriers_on_deck(self) -> list[int]:
+    """
+    Read the deck carrier presence sensors and return the positions where carriers
+    are currently detected.
+
+    This sends the `C0:RC` command to query the rear deck sensors. No autoload
+    movement is performed. The returned hex bitmask is decoded into a list of
+    track numbers (1-54), where each number corresponds to a deck rail position
+    that is occupied by a carrier.
+
+    Returns:
+        list[int]: Sorted list of deck rail positions where carriers are present.
+    """
+    resp = await self.send_command(module="C0", command="RC")
+
+    ce_resp = resp.split("ce")[-1]
+
+    return self._decode_hex_bitmask_to_track_list(ce_resp)
+
+  async def request_presence_of_carriers_on_loading_tray(self) -> list[int]:
+    """
+    Moves autoload sled across loading tray and reads its front-facing proximity sensors
+    to determine which tray positions contain carriers.
+
+    This sends the `C0:CS` command, which provides a hex-encoded presence bitmask
+    for the loading tray. The bitmask is decoded into a list of track numbers (1-54)
+    representing tray positions that currently contain a carrier.
+
+    Returns:
+        list[int]: Sorted list of loading-tray positions where carriers are present.
+
+    Raises:
+        ValueError: If the response is missing the expected 'cd' field.
+    """
+    resp = await self.send_command(module="C0", command="CS")
+
+    if "cd" not in resp:
+      raise ValueError(f"CD field missing: {resp!r}")
+
+    mask_hex = resp.split("cd", 1)[1].strip()
+
+    return self._decode_hex_bitmask_to_track_list(mask_hex)
+
+  async def request_presence_of_single_carrier_on_loading_tray(self, track: int) -> bool:
+    """
+    Check whether a specific loading-tray track contains a carrier.
+
+    This sends the `C0:CT` command, which instructs the autoload sled to move to
+    the specified tray track and read its front-facing proximity sensor. Unlike
+    `request_presence_of_carriers_on_loading_tray`, which scans all tray
+    positions and returns a bitmask, this method queries only a single track and
+    returns a boolean result.
+
+    Args:
+        track (int): The loading-tray track number to query (1-54).
+
+    Returns:
+        bool: True if a carrier is detected at the given track; False otherwise.
+
+    Raises:
+        AssertionError: If `track` is outside the valid range (1-54).
+    """
+
+    assert 1 <= track <= 54, "track must be between 1 and 54"
+
+    track_str = str(track).zfill(2)
+
     resp = await self.send_command(
       module="C0",
       command="CT",
       fmt="ct#",
-      cp=carrier_position_str,
+      cp=track_str,
     )
     assert resp is not None
-    return resp["ct"] == 1
 
-  # Move autoload/scanner X-drive into slot number
+    return int(resp["ct"]) == 1
+
+  async def request_single_carrier_presence(self, carrier_position: int):
+    """Request single carrier presence on the loading tray (not on deck)"""
+    warnings.warn(  # TODO: remove 2025-02
+      "`request_single_carrier_presence` is deprecated and will be "
+      "removed in 2025-02 use `is_carrier_present_on_loading_tray` instead.",
+      DeprecationWarning,
+      stacklevel=2,
+    )
+    await self.request_presence_of_single_carrier_on_loading_tray(carrier_position)
+
+  # -------------- 3.13.3 Autoload movement commands --------------
+
+  def _compute_end_rail_of_carrier(self, carrier: Carrier, track_width: float = 22.5) -> int:
+    """Compute end rail of carrier based on its location on the deck."""
+
+    carrier_width = carrier.get_location_wrt(self.deck).x - 100 + carrier.get_absolute_size_x()
+    carrier_end_rail = int(carrier_width / track_width)
+
+    assert 1 <= carrier_end_rail <= 54, "carrier loading rail must be between 1 and 54"
+
+    return carrier_end_rail
+
   async def move_autoload_to_slot(self, slot_number: int):
+    """deprecated - use `move_autoload_to_track` instead."""
+
+    warnings.warn(  # TODO: remove 2025-02
+      "`move_autoload_to_slot` is deprecated and will be "
+      "removed in 2025-02 use `move_autoload_to_track` instead.",
+      DeprecationWarning,
+      stacklevel=2,
+    )
+
+    return await self.move_autoload_to_track(track=slot_number)
+
+  async def move_autoload_to_track(self, track: int):
     """Move autoload to specific slot/track position"""
 
-    assert 1 <= slot_number <= 54, "slot_number must be between 1 and 54"
-    slot_no_as_safe_str = str(slot_number).zfill(2)
+    assert 1 <= track <= 54, "track must be between 1 and 54"
 
-    return await self.send_command(module="I0", command="XP", xp=slot_no_as_safe_str)
+    await self.move_autoload_to_safe_z_position()
 
-  # Park autoload
+    track_no_as_safe_str = str(track).zfill(2)
+    return await self.send_command(module="I0", command="XP", xp=track_no_as_safe_str)
+
   async def park_autoload(self):
     """Park autoload"""
 
     # Identify max number of x positions for your liquid handler
     max_x_pos = str(self.extended_conf["xt"]).zfill(2)
 
+    await self.move_autoload_to_safe_z_position()
+
     # Park autoload to max x position available
     return await self.send_command(module="I0", command="XP", xp=max_x_pos)
 
-  # TODO:(command:CA) Push out carrier to loading tray (after identification CI)
+  async def take_carrier_out_to_autoload_belt(self, carrier: Carrier):
+    """Take carrier out to identification position for barcode reading.
+    Start: carrier is already on the deck
+    """
 
-  async def unload_carrier(self, carrier: Carrier):
-    """Use autoload to unload carrier."""
     # Identify carrier end rail
-    track_width = 22.5
-    carrier_width = carrier.get_absolute_location().x - 100 + carrier.get_absolute_size_x()
-    carrier_end_rail = int(carrier_width / track_width)
-    assert 1 <= carrier_end_rail <= 54, "carrier loading rail must be between 1 and 54"
+    carrier_end_rail = self._compute_end_rail_of_carrier(carrier)
 
+    carrier_on_loading_tray = await self.request_single_carrier_presence(carrier_end_rail)
+
+    if not carrier_on_loading_tray:
+      try:
+        await self.send_command(
+          module="C0",
+          command="CN",
+          cp=str(carrier_end_rail).zfill(2),
+        )
+      except Exception as e:
+        await self.move_autoload_to_safe_z_position()
+        raise RuntimeError(
+          f"Failed to take carrier at rail {carrier_end_rail} " f"out to autoload belt: {e}"
+        )
+    else:
+      raise ValueError(f"Carrier is already on the loading tray at position {carrier_end_rail}.")
+
+  # -------------- 3.13.4 Autoload barcode reading commands --------------
+
+  # 1D barcode symbology bitmask
+  # Each symbology corresponds to exactly one bit in the 8-bit barcode type field.
+  # Bit definitions from spec:
+  #   Bit 0 = ISBT Standard
+  #   Bit 1 = Code 128 (Subset B and C)
+  #   Bit 2 = Code 39
+  #   Bit 3 = Codabar
+  #   Bit 4 = Code 2of5 Interleaved
+  #   Bit 5 = UPC A/E
+  #   Bit 6 = YESN/EAN 8
+  #   Bit 7 = (unused / undocumented)
+
+  barcode_1d_symbology_dict: dict[Barcode1DSymbology, str] = {
+    "ISBT Standard": "01",  # bit 0 → 0b00000001 → 0x01 → 1
+    "Code 128 (Subset B and C)": "02",  # bit 1 → 0b00000010 → 0x02 → 2
+    "Code 39": "04",  # bit 2 → 0b00000100 → 0x04 → 4
+    "Codebar": "08",  # bit 3 → 0b00001000 → 0x08 → 8
+    "Code 2of5 Interleaved": "10",  # bit 4 → 0b00010000 → 0x10 → 16
+    "UPC A/E": "20",  # bit 5 → 0b00100000 → 0x20 → 32
+    "YESN/EAN 8": "40",  # bit 6 → 0b01000000 → 0x40 → 64
+    # Bit 7 → 0b10000000 → 0x80 → 128  (not documented, so omitted)
+    "ANY 1D": "7F",  # bits 0-6 → 0b01111111 → 0x7F → 127
+  }
+
+  async def set_1d_barcode_type(
+    self,
+    barcode_symbology: Optional[Barcode1DSymbology],
+  ) -> None:
+    """Set 1D barcode type for autoload barcode reading."""
+
+    # If none given, use the default
+    if barcode_symbology is None:
+      barcode_symbology = self._default_1d_symbology
+
+    # Prove to mypy that barcode_symbology is no longer Optional
+    assert barcode_symbology is not None
+
+    await self.send_command(
+      module="C0",
+      command="CB",
+      bt=self.barcode_1d_symbology_dict[barcode_symbology],
+    )
+
+    self._default_1d_symbology = barcode_symbology
+
+  async def set_barcode_type(
+    self,
+    ISBT_Standard: bool = True,
+    code128: bool = True,
+    code39: bool = True,
+    codebar: bool = True,
+    code2_5: bool = True,
+    UPC_AE: bool = True,
+    EAN8: bool = True,
+  ):
+    """deprecated - use set_1d_barcode_type instead"""
+
+    warnings.warn(  # TODO: remove 2025-02
+      "`set_barcode_type` is deprecated and will be "
+      "removed in 2025-02 use `set_1d_barcode_type` instead.",
+      DeprecationWarning,
+      stacklevel=2,
+    )
+
+    # Encode values into bit pattern. Last bit is always one.
+    bt = ""
+    for t in [
+      ISBT_Standard,
+      code128,
+      code39,
+      codebar,
+      code2_5,
+      UPC_AE,
+      EAN8,
+      True,
+    ]:
+      bt += "1" if t else "0"
+    # Convert bit pattern to hex.
+    bt_hex = hex(int(bt, base=2))
+    return await self.send_command(module="C0", command="CB", bt=bt_hex)
+
+  # TODO:(command:CW) Unload carrier finally
+
+  async def load_carrier_from_tray_and_scan_carrier_barcode(
+    self,
+    carrier: Carrier,
+    carrier_barcode_reading: bool = True,
+    barcode_symbology: Optional[Barcode1DSymbology] = None,
+    barcode_position: float = 4.3,  # mm
+    barcode_reading_window_width: float = 38.0,  # mm
+    reading_speed: float = 128.1,  # mm/sec
+  ) -> Optional[Barcode]:
+    """Load carrier from loading tray and - optionally - scan 1D carrier barcode"""
+
+    if barcode_symbology is None:
+      barcode_symbology = self._default_1d_symbology
+
+    assert barcode_symbology is not None
+
+    carrier_end_rail = self._compute_end_rail_of_carrier(carrier)
     carrier_end_rail_str = str(carrier_end_rail).zfill(2)
 
-    # Unload and read out barcodes
-    resp = await self.send_command(
-      module="C0",
-      command="CR",
-      cp=carrier_end_rail_str,
-    )
-    # Park autoload
-    await self.park_autoload()
+    assert 1 <= int(carrier_end_rail_str) <= 54
+    assert 0 <= barcode_position <= 470
+    assert 0.1 <= barcode_reading_window_width <= 99.9
+    assert 1.5 <= reading_speed <= 160.0
+
+    try:
+      resp = await self.send_command(
+        module="C0",
+        command="CI",
+        cp=carrier_end_rail_str,
+        bi=f"{round(barcode_position*10):04}",
+        bw=f"{round(barcode_reading_window_width*10):03}",
+        co="0960",  # Distance between containers (pattern) [0.1 mm]
+        cv=f"{round(reading_speed*10):04}",
+      )
+    except Exception as e:
+      if carrier_barcode_reading:
+        await self.move_autoload_to_safe_z_position()
+        raise RuntimeError(
+          f"Failed to load carrier at rail {carrier_end_rail} " f"and scan barcode: {e}"
+        )
+      else:
+        pass
+
+    if not carrier_barcode_reading:
+      return None
+
+    barcode_str = resp.split("bb/")[-1]
+
+    return Barcode(data=barcode_str, symbology=barcode_symbology, position_on_resource="right")
+
+  async def unload_carrier_after_carrier_barcode_scanning(self):
+    """After scanning the barcode of the carrier currently engaged with
+    the autoload sled, unload the carrier back to the loading tray.
+    """
+    try:
+      resp = await self.send_command(
+        module="C0",
+        command="CA",
+      )
+    except Exception as e:
+      await self.move_autoload_to_safe_z_position()
+      raise RuntimeError(f"Failed to unload carrier after barcode scanning: {e}")
+
     return resp
+
+  async def set_carrier_monitoring(self, should_monitor: bool = False):
+    """Set carrier monitoring
+
+    Args:
+      should_monitor: whether carrier should be monitored.
+
+    Returns:
+      True if present, False otherwise
+    """
+
+    return await self.send_command(module="C0", command="CU", cu=should_monitor)
+
+  async def load_carrier_from_autoload_belt(
+    self,
+    barcode_reading: bool = False,
+    barcode_reading_direction: Literal["horizontal", "vertical"] = "horizontal",
+    barcode_symbology: Optional[Barcode1DSymbology] = None,
+    reading_position_of_first_barcode: float = 63.0,  # mm
+    no_container_per_carrier: int = 5,
+    distance_between_containers: float = 96.0,  # mm
+    width_of_reading_window: float = 38.0,  # mm
+    reading_speed: float = 128.1,  # mm/secs
+    park_autoload_after: bool = True,
+  ) -> dict[int, Optional[Barcode]]:
+    """Finishes loading the carrier that is currently engaged with the autoload sled,
+    i.e. is currently in the identification position.
+    """
+
+    assert barcode_reading_direction in ["horizontal", "vertical"]
+    assert 0 <= reading_position_of_first_barcode <= 470
+    assert 0 <= no_container_per_carrier <= 32
+    assert 0 <= distance_between_containers <= 470
+    assert 0.1 <= width_of_reading_window <= 99.9
+    assert 1.5 <= reading_speed <= 160.0
+
+    barcode_reading_direction_dict = {
+      "vertical": "0",
+      "horizontal": "1",
+    }
+
+    if barcode_symbology is None:
+      barcode_symbology = self._default_1d_symbology
+    assert barcode_symbology is not None
+
+    no_container_per_carrier_str = str(no_container_per_carrier).zfill(2)
+    reading_position_of_first_barcode_str = str(
+      round(reading_position_of_first_barcode * 10)
+    ).zfill(4)
+    distance_between_containers_str = str(round(distance_between_containers * 10)).zfill(4)
+    width_of_reading_window_str = str(round(width_of_reading_window * 10)).zfill(3)
+    reading_speed_str = str(round(reading_speed * 10)).zfill(4)
+
+    if not barcode_reading:
+      barcode_reading_direction = "vertical"  # no movement
+      no_container_per_carrier_str = "00"  # no scanning
+
+    else:
+      # Choose barcode symbology
+      await self.set_1d_barcode_type(barcode_symbology=barcode_symbology)
+
+      self._default_1d_symbology = barcode_symbology
+
+    try:
+      resp = await self.send_command(
+        module="C0",
+        command="CL",
+        bd=barcode_reading_direction_dict[barcode_reading_direction],
+        bp=reading_position_of_first_barcode_str,  # Barcode reading position of first barcode [mm]
+        cn=no_container_per_carrier_str,
+        co=distance_between_containers_str,  # Distance between containers (pattern) [mm]
+        cf=width_of_reading_window_str,  # Width of reading window [mm]
+        cv=reading_speed_str,  # Carrier reading speed [mm/sec]/
+      )
+    except Exception as e:
+      await self.move_autoload_to_safe_z_position()
+      raise RuntimeError(f"Failed to load carrier from autoload belt: {e}")
+
+    if park_autoload_after:
+      await self.park_autoload()
+
+    assert isinstance(resp, str), f"Response is not a string: {resp!r}"
+
+    barcode_dict: dict[int, Optional[Barcode]] = {}
+
+    if barcode_reading:
+      resp_list = resp.split("bb/")[-1].split("/")  # remove header
+
+      assert len(resp_list) == no_container_per_carrier, (
+        f"Number of barcodes read ({len(resp_list)}) does not match "
+        f"expected number ({no_container_per_carrier})"
+      )
+      for i in range(0, no_container_per_carrier):
+        if resp_list[i] == "00":
+          barcode_dict[i] = None
+        else:
+          barcode_dict[i] = Barcode(
+            data=resp_list[i], symbology=barcode_symbology, position_on_resource="right"
+          )
+
+    return barcode_dict
+
+  # -------------- 3.13.5 Autoload carrier loading/unloading commands --------------
 
   async def load_carrier(
     self,
     carrier: Carrier,
+    carrier_barcode_reading: bool = True,
     barcode_reading: bool = False,
     barcode_reading_direction: Literal["horizontal", "vertical"] = "horizontal",
-    barcode_symbology: Literal[
-      "ISBT Standard",
-      "Code 128 (Subset B and C)",
-      "Code 39",
-      "Codebar",
-      "Code 2of5 Interleaved",
-      "UPC A/E",
-      "YESN/EAN 8",
-      "Code 93",
-    ] = "Code 128 (Subset B and C)",
+    barcode_symbology: Optional[Barcode1DSymbology] = None,
     no_container_per_carrier: int = 5,
+    reading_position_of_first_barcode: float = 63.0,  # mm
+    distance_between_containers: float = 96.0,  # mm
+    width_of_reading_window: float = 38.0,  # mm
+    reading_speed: float = 128.1,  # mm/secs
     park_autoload_after: bool = True,
-  ):
+  ) -> dict:
     """
     Use autoload to load carrier.
 
@@ -6036,29 +8306,15 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
       park_autoload_after: Whether to park autoload after loading. Default True.
     """
 
-    barcode_reading_direction_dict = {
-      "vertical": "0",
-      "horizontal": "1",
-    }
-    barcode_symbology_dict = {
-      "ISBT Standard": "70",
-      "Code 128 (Subset B and C)": "71",
-      "Code 39": "72",
-      "Codebar": "73",
-      "Code 2of5 Interleaved": "74",
-      "UPC A/E": "75",
-      "YESN/EAN 8": "76",
-      "Code 93": "",
-    }
+    if barcode_symbology is None:
+      barcode_symbology = self._default_1d_symbology
+
     # Identify carrier end rail
-    track_width = 22.5
-    carrier_width = carrier.get_absolute_location().x - 100 + carrier.get_absolute_size_x()
-    carrier_end_rail = int(carrier_width / track_width)
-    assert 1 <= carrier_end_rail <= 54, "carrier loading rail must be between 1 and 54"
+    carrier_end_rail = self._compute_end_rail_of_carrier(carrier)
+    assert 1 <= int(carrier_end_rail) <= 54, "carrier loading rail must be between 1 and 54"
 
     # Determine presence of carrier at defined position
-    presence_check = await self.request_single_carrier_presence(carrier_end_rail)
-    carrier_end_rail_str = str(carrier_end_rail).zfill(2)
+    presence_check = await self.request_presence_of_single_carrier_on_loading_tray(carrier_end_rail)
 
     if presence_check != 1:
       raise ValueError(
@@ -6067,34 +8323,44 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
       )
 
     # Set carrier type for identification purposes
-    await self.send_command(module="C0", command="CI", cp=carrier_end_rail_str)
+    carrier_barcode = await self.load_carrier_from_tray_and_scan_carrier_barcode(
+      carrier, carrier_barcode_reading=carrier_barcode_reading
+    )
 
     # Load carrier
     # with barcoding
     if barcode_reading:
       # Choose barcode symbology
-      await self.send_command(
-        module="C0",
-        command="CB",
-        bt=barcode_symbology_dict[barcode_symbology],
-      )
-      # Load and read out barcodes
-      resp = await self.send_command(
-        module="C0",
-        command="CL",
-        bd=barcode_reading_direction_dict[barcode_reading_direction],
-        bp="0616",  # Barcode reading direction (0 = vertical 1 = horizontal)
-        co="0960",  # Distance between containers (pattern) [0.1 mm]
-        cf="380",  # Width of reading window [0.1 mm]
-        cv="1281",  # Carrier reading speed [0.1 mm]/s
-        cn=str(no_container_per_carrier).zfill(2),  # No of containers (cups, plates) in a carrier
+      await self.set_1d_barcode_type(barcode_symbology=barcode_symbology)
+      self._default_1d_symbology = barcode_symbology
+
+      # Load and read out barcodes # TODO: swap with load_carrier_from_autoload_belt?
+      resp = await self.load_carrier_from_autoload_belt(
+        barcode_reading=barcode_reading,
+        barcode_reading_direction=barcode_reading_direction,
+        barcode_symbology=barcode_symbology,
+        reading_position_of_first_barcode=reading_position_of_first_barcode,
+        no_container_per_carrier=no_container_per_carrier,
+        distance_between_containers=distance_between_containers,
+        width_of_reading_window=width_of_reading_window,
+        reading_speed=reading_speed,
+        park_autoload_after=False,
       )
     else:  # without barcoding
-      resp = await self.send_command(module="C0", command="CL", cn="00")
+      resp = await self.load_carrier_from_autoload_belt(
+        barcode_reading=False, park_autoload_after=False
+      )
 
     if park_autoload_after:
       await self.park_autoload()
-    return resp
+
+    # Parse response and create output dict
+    output = {
+      "carrier_barcode": carrier_barcode if carrier_barcode_reading else None,
+      "container_barcodes": resp if barcode_reading else None,
+    }
+
+    return output
 
   async def set_loading_indicators(self, bit_pattern: List[bool], blink_pattern: List[bool]):
     """Set loading indicators (LEDs)
@@ -6123,79 +8389,138 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
       cb=blink_pattern_hex,
     )
 
-  # TODO:(command:CS) Check for presence of carriers on loading tray
-
-  async def set_barcode_type(
+  async def verify_and_wait_for_carriers(
     self,
-    ISBT_Standard: bool = True,
-    code128: bool = True,
-    code39: bool = True,
-    codebar: bool = True,
-    code2_5: bool = True,
-    UPC_AE: bool = True,
-    EAN8: bool = True,
+    check_interval: float = 1.0,
   ):
-    """Set bar code type: which types of barcodes will be scanned for.
+    """Verify that carriers have been loaded at expected rail positions.
+
+    This function checks if carriers are physically present on the deck at the specified
+    rail positions using the deck's presence sensors. If any carriers are missing, it will:
+    1. Prompt the user to load the missing carriers
+    2. Flash LEDs at the missing positions using set_loading_indicators
+    3. Continue checking until all carriers are detected
 
     Args:
-      ISBT_Standard: ISBT_Standard. Default True.
-      code128: Code128. Default True.
-      code39: Code39. Default True.
-      codebar: Codebar. Default True.
-      code2_5: Code2_5. Default True.
-      UPC_AE: UPC_AE. Default True.
-      EAN8: EAN8. Default True.
+      check_interval: Interval in seconds between presence checks (default: 1.0)
+
+    Raises:
+      ValueError: If no carriers are found on the deck.
     """
+    # Extract carriers from deck children with start and end rail positions
+    carrier_rails: List[Tuple[int, int]] = []  # List of (start_rail, end_rail) tuples
 
-    # Encode values into bit pattern. Last bit is always one.
-    bt = ""
-    for t in [
-      ISBT_Standard,
-      code128,
-      code39,
-      codebar,
-      code2_5,
-      UPC_AE,
-      EAN8,
-      True,
-    ]:
-      bt += "1" if t else "0"
+    for child in self.deck.children:
+      if isinstance(child, Carrier):
+        # Get x coordinate relative to deck
+        carrier_x = child.get_location_wrt(self.deck).x
+        carrier_start_rail = rails_for_x_coordinate(carrier_x)
+        carrier_end_rail = rails_for_x_coordinate(carrier_x - 100.0 + child.get_absolute_size_x())
 
-    # Convert bit pattern to hex.
-    bt_hex = hex(int(bt, base=2))
+        # Verify rails are valid
+        carrier_start_rail = max(1, min(carrier_start_rail, 54))
+        if 1 <= carrier_end_rail <= 54:
+          carrier_rails.append((carrier_start_rail, carrier_end_rail))
 
-    return await self.send_command(module="C0", command="CB", bt=bt_hex)
+    if len(carrier_rails) == 0:
+      raise ValueError("No carriers found on deck. Assign carriers to the deck.")
 
-  # TODO:(command:CW) Unload carrier finally
+    # Extract end rails for comparison with detected rails
+    # The presence detection reports the end rail position
+    expected_end_rails = [end_rail for _, end_rail in carrier_rails]
 
-  async def set_carrier_monitoring(self, should_monitor: bool = False):
-    """Set carrier monitoring
+    # Check initial presence
+    detected_rails = set(await self.request_presence_of_carriers_on_deck())
+    missing_end_rails = sorted(set(expected_end_rails) - detected_rails)
 
-    Args:
-      should_monitor: whether carrier should be monitored.
+    if len(missing_end_rails) == 0:
+      logger.info(f"All carriers detected at end rail positions: {expected_end_rails}")
+      # Turn off all indicators
+      await self.set_loading_indicators(
+        bit_pattern=[False] * 54,
+        blink_pattern=[False] * 54,
+      )
+      print(f"\n✓ All carriers successfully detected at end rail positions: {expected_end_rails}\n")
+      return
 
-    Returns:
-      True if present, False otherwise
-    """
+    # Prompt user about missing carriers
+    print(
+      f"\n{'='*60}\n"
+      f"CARRIER LOADING REQUIRED\n"
+      f"{'='*60}\n"
+      f"Expected carriers at end rail positions: {expected_end_rails}\n"
+      f"Detected carriers at rail positions: {sorted(detected_rails)}\n"
+      f"Missing carriers at end rail positions: {missing_end_rails}\n"
+      f"{'='*60}\n"
+      f"Please load the missing carriers. LEDs will flash at the carrier positions.\n"
+      f"The system will automatically detect when all carriers are loaded.\n"
+      f"{'='*60}\n"
+    )
 
-    return await self.send_command(module="C0", command="CU", cu=should_monitor)
+    # Flash LEDs until all carriers are detected
+    while missing_end_rails:
+      # Create bit pattern for missing carriers
+      # Flash all LEDs from start_rail to end_rail (inclusive) for each missing carrier
+      bit_pattern = [False] * 54
+      blink_pattern = [False] * 54
 
-  # TODO:(command:CN) Take out the carrier to identification position
+      # For each missing carrier (identified by missing end rail), flash all its rails
+      for missing_end_rail in missing_end_rails:
+        # Find the carrier with this end rail
+        for start_rail, end_rail in carrier_rails:
+          if end_rail == missing_end_rail:
+            # Flash all LEDs from start_rail to end_rail (inclusive)
+            for rail in range(start_rail, end_rail + 1):
+              if 1 <= rail <= 54:
+                indicator_index = rail - 1  # Convert rail (1-54) to index (0-53)
+                bit_pattern[indicator_index] = True
+                blink_pattern[indicator_index] = True
+            break
 
-  # -------------- 3.13.3 Auto load query --------------
+      # Set loading indicators
+      await self.set_loading_indicators(bit_pattern[::-1], blink_pattern[::-1])
 
-  # TODO:(command:RC) Query presence of carrier on deck
+      # Wait before checking again
+      await asyncio.sleep(check_interval)
 
-  async def request_auto_load_slot_position(self):
-    """Request auto load slot position.
+      # Check for presence again
+      detected_rails = set(await self.request_presence_of_carriers_on_deck())
+      missing_end_rails = sorted(set(expected_end_rails) - detected_rails)
 
-    Returns:
-      slot position (0..54)
-    """
+    # All carriers detected, turn off all indicators
+    logger.info(f"All carriers successfully detected at end rail positions: {expected_end_rails}")
+    await self.set_loading_indicators(
+      bit_pattern=[False] * 54,
+      blink_pattern=[False] * 54,
+    )
+    print("\n✓ All carriers successfully loaded and detected!\n")
 
-    return await self.send_command(module="C0", command="QA", fmt="qa##")
+  async def unload_carrier(
+    self,
+    carrier: Carrier,
+    park_autoload_after: bool = True,
+  ):
+    """Use autoload to unload carrier."""
+    # Identify carrier end rail
+    track_width = 22.5
+    carrier_width = carrier.get_location_wrt(self.deck).x - 100 + carrier.get_absolute_size_x()
+    carrier_end_rail = int(carrier_width / track_width)
 
-  # TODO:(command:CQ) Request auto load module type
+    assert 1 <= carrier_end_rail <= 54, "carrier loading rail must be between 1 and 54"
+
+    carrier_end_rail_str = str(carrier_end_rail).zfill(2)
+
+    # Unload
+    resp = await self.send_command(
+      module="C0",
+      command="CR",
+      cp=carrier_end_rail_str,
+    )
+
+    if park_autoload_after:
+      await self.park_autoload()
+
+    return resp
 
   # -------------- 3.14 G1-3/ CR Needle Washer commands --------------
 
@@ -6329,11 +8654,6 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
 
     return await self.send_command(module="C0", command="FI")
 
-  async def initialize_autoload(self):
-    """Initialize autoload (for standalone configuration only)"""
-
-    return await self.send_command(module="C0", command="II")
-
   async def position_components_for_free_iswap_y_range(self):
     """Position all components so that there is maximum free Y range for iSWAP"""
 
@@ -6367,6 +8687,17 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
       step_size: Y Step size [1mm] Between -99.9 and 99.9 if allow_splitting is False.
       allow_splitting: Allow splitting of the movement into multiple steps. Default False.
     """
+
+    # check if iswap will hit the first (backmost) channel
+    # we only need to check for positive step sizes because the iswap is always behind the first channel
+    if step_size < 0:
+      y_pos_channel_0 = await self.request_y_pos_channel_n(0)
+      current_y_pos_iswap = await self.iswap_rotation_drive_request_y()
+      if current_y_pos_iswap + step_size < y_pos_channel_0:
+        raise ValueError(
+          f"iSWAP will hit the first (backmost) channel. Current iSWAP Y position: {current_y_pos_iswap} mm, "
+          f"first channel Y position: {y_pos_channel_0} mm, requested step size: {step_size} mm"
+        )
 
     direction = 0 if step_size >= 0 else 1
     max_step_size = 99.9
@@ -6409,7 +8740,7 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
     """Move iSWAP X to absolute position"""
     loc = await self.request_iswap_position()
     await self.move_iswap_x_relative(
-      step_size=x_position - loc["xs"],
+      step_size=x_position - loc.x,
       allow_splitting=True,
     )
 
@@ -6417,7 +8748,7 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
     """Move iSWAP Y to absolute position"""
     loc = await self.request_iswap_position()
     await self.move_iswap_y_relative(
-      step_size=y_position - loc["yj"],
+      step_size=y_position - loc.y,
       allow_splitting=True,
     )
 
@@ -6425,52 +8756,55 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
     """Move iSWAP Z to absolute position"""
     loc = await self.request_iswap_position()
     await self.move_iswap_z_relative(
-      step_size=z_position - loc["zj"],
+      step_size=z_position - loc.z,
       allow_splitting=True,
     )
 
   async def open_not_initialized_gripper(self):
     return await self.send_command(module="C0", command="GI")
 
-  async def iswap_open_gripper(self, open_position: Optional[int] = None):
+  async def iswap_open_gripper(self, open_position: Optional[float] = None):
     """Open gripper
 
     Args:
-      open_position: Open position [0.1mm] (0.1 mm = 16 increments) The gripper moves to pos + 20.
+      open_position: Open position [mm] (0.1 mm = 16 increments) The gripper moves to pos + 20.
                      Must be between 0 and 9999. Default 1320 for iSWAP 4.0 (landscape). Default to
                      910 for iSWAP 3 (portrait).
     """
 
     if open_position is None:
-      open_position = 910 if (await self.get_iswap_version()).startswith("3") else 1320
+      open_position = 91.0 if (await self.get_iswap_version()).startswith("3") else 132.0
 
-    assert 0 <= open_position <= 9999, "open_position must be between 0 and 9999"
+    assert 0 <= open_position <= 999.9, "open_position must be between 0 and 999.9"
 
-    return await self.send_command(module="C0", command="GF", go=f"{open_position:04}")
+    return await self.send_command(module="C0", command="GF", go=f"{round(open_position*10):04}")
 
   async def iswap_close_gripper(
     self,
     grip_strength: int = 5,
-    plate_width: int = 0,
-    plate_width_tolerance: int = 0,
+    plate_width: float = 0,
+    plate_width_tolerance: float = 0,
   ):
     """Close gripper
 
-    The gripper should be at the position gb+gt+20 before sending this command.
+    The gripper should be at the position plate_width+plate_width_tolerance+2.0mm before sending this command.
 
     Args:
       grip_strength: Grip strength. 0 = low . 9 = high. Default 5.
-      plate_width: Plate width [0.1mm]
-                   (gb should be > min. Pos. + stop ramp + gt -> gb > 760 + 5 + g )
-      plate_width_tolerance: Plate width tolerance [0.1mm]. Must be between 0 and 99. Default 20.
+      plate_width: Plate width [mm] (gb should be > min. Pos. + stop ramp + gt -> gb > 760 + 5 + g )
+      plate_width_tolerance: Plate width tolerance [mm]. Must be between 0 and 9.9. Default 2.0.
     """
+
+    assert 0 <= grip_strength <= 9, "grip_strength must be between 0 and 9"
+    assert 0 <= plate_width <= 999.9, "plate_width must be between 0 and 999.9"
+    assert 0 <= plate_width_tolerance <= 9.9, "plate_width_tolerance must be between 0 and 9.9"
 
     return await self.send_command(
       module="C0",
       command="GC",
       gw=grip_strength,
-      gb=plate_width,
-      gt=plate_width_tolerance,
+      gb=f"{round(plate_width*10):04}",
+      gt=f"{round(plate_width_tolerance*10):02}",
     )
 
   # -------------- 3.17.2 Stack handling commands CP --------------
@@ -6520,7 +8854,7 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
     collision_control_level: int = 1,
     acceleration_index_high_acc: int = 4,
     acceleration_index_low_acc: int = 1,
-    iswap_fold_up_sequence_at_the_end_of_process: bool = True,
+    iswap_fold_up_sequence_at_the_end_of_process: bool = False,
   ):
     """Get plate using iswap.
 
@@ -6546,7 +8880,7 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
                                Default 1.
       acceleration_index_high_acc: acceleration index high acc. Must be between 0 and 4. Default 4.
       acceleration_index_low_acc: acceleration index high acc. Must be between 0 and 4. Default 1.
-      iswap_fold_up_sequence_at_the_end_of_process: fold up sequence at the end of process. Default True.
+      iswap_fold_up_sequence_at_the_end_of_process: fold up sequence at the end of process. Default False.
     """
 
     assert 0 <= x_position <= 30000, "x_position must be between 0 and 30000"
@@ -6614,7 +8948,7 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
     collision_control_level: int = 1,
     acceleration_index_high_acc: int = 4,
     acceleration_index_low_acc: int = 1,
-    iswap_fold_up_sequence_at_the_end_of_process: bool = True,
+    iswap_fold_up_sequence_at_the_end_of_process: bool = False,
   ):
     """put plate
 
@@ -6639,7 +8973,7 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
             Default 4.
       acceleration_index_low_acc: acceleration index high acc. Must be between 0 and 4.
             Default 1.
-      iswap_fold_up_sequence_at_the_end_of_process: fold up sequence at the end of process. Default True.
+      iswap_fold_up_sequence_at_the_end_of_process: fold up sequence at the end of process. Default False.
     """
 
     assert 0 <= x_position <= 30000, "x_position must be between 0 and 30000"
@@ -6686,6 +9020,86 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
     self._iswap_parked = False
     return command_output
 
+  async def request_iswap_rotation_drive_position_increments(self) -> int:
+    """Query the iSWAP rotation drive position (units: increments) from the firmware."""
+    response = await self.send_command(module="R0", command="RW", fmt="rw######")
+    return cast(int, response["rw"])
+
+  async def request_iswap_rotation_drive_orientation(self) -> "RotationDriveOrientation":
+    """
+    Request the iSWAP rotation drive orientation.
+    This is the orientation of the iSWAP rotation drive (relative to the machine).
+
+    Uses empirically determined increment values:
+      FRONT: -25 ± 50
+      RIGHT: +29068 ± 50
+      LEFT:  -29116 ± 50
+
+    Returns:
+      RotationDriveOrientation: The interpreted rotation orientation (LEFT, FRONT, RIGHT).
+    """
+    # Map motor increments to rotation orientations (constant lookup table).
+    rotation_orientation_to_motor_increment_dict = {
+      STARBackend.RotationDriveOrientation.FRONT: range(-75, 26),
+      STARBackend.RotationDriveOrientation.RIGHT: range(29018, 29119),
+      STARBackend.RotationDriveOrientation.LEFT: range(-29166, -29065),
+      STARBackend.RotationDriveOrientation.PARKED_RIGHT: range(29450, 29550),
+      # TODO: add range for STAR(let)s with "PARKED_LEFT" setting
+    }
+
+    motor_position_increments = await self.request_iswap_rotation_drive_position_increments()
+
+    for orientation, increment_range in rotation_orientation_to_motor_increment_dict.items():
+      if motor_position_increments in increment_range:
+        return orientation
+
+    raise ValueError(
+      f"Unknown rotation orientation: {motor_position_increments}. "
+      f"Expected one of {list(rotation_orientation_to_motor_increment_dict.values())}."
+    )
+
+  async def request_iswap_wrist_drive_position_increments(self) -> int:
+    """Query the iSWAP wrist drive position (units: increments) from the firmware."""
+    response = await self.send_command(module="R0", command="RT", fmt="rt######")
+    return cast(int, response["rt"])
+
+  async def request_iswap_wrist_drive_orientation(self) -> "WristDriveOrientation":
+    """
+    Request the iSWAP wrist drive orientation.
+    This is the orientation of the iSWAP wrist drive (always in relation to the iSWAP arm/rotation drive).
+
+    e.g.:
+    1) iSWAP RotationDriveOrientation.FRONT (i.e. pointing to the front of the machine) + iSWAP WristDriveOrientation.STRAIGHT (i.e. wrist is also pointing to the front)
+
+    2) iSWAP RotationDriveOrientation.LEFT (i.e. pointing to the left of the machine) + iSWAP WristDriveOrientation.STRAIGHT (i.e. wrist is also pointing to the left)
+
+    3) iSWAP RotationDriveOrientation.FRONT (i.e. pointing to the front of the machine) + iSWAP WristDriveOrientation.RIGHT (i.e. wrist is pointing to the left !)
+
+    The relative wrist orientation is reported as a motor position increment by the STAR firmware. This value is mapped to a `WristDriveOrientation` enum member.
+
+    Returns:
+      WristDriveOrientation: The interpreted wrist orientation (e.g., RIGHT, STRAIGHT, LEFT, REVERSE).
+    """
+
+    # Map motor increments to wrist orientations (constant lookup table).
+    wrist_orientation_to_motor_increment_dict = {
+      STARBackend.WristDriveOrientation.RIGHT: range(-26_627, -26_527),
+      STARBackend.WristDriveOrientation.STRAIGHT: range(-8_804, -8_704),
+      STARBackend.WristDriveOrientation.LEFT: range(9_051, 9_151),
+      STARBackend.WristDriveOrientation.REVERSE: range(26_802, 26_902),
+    }
+
+    motor_position_increments = await self.request_iswap_wrist_drive_position_increments()
+
+    for orientation, increment_range in wrist_orientation_to_motor_increment_dict.items():
+      if motor_position_increments in increment_range:
+        return orientation
+
+    raise ValueError(
+      f"Unknown wrist orientation: {motor_position_increments}. "
+      f"Expected one of {list(wrist_orientation_to_motor_increment_dict)}."
+    )
+
   async def iswap_rotate(
     self,
     rotation_drive: "RotationDriveOrientation",
@@ -6698,7 +9112,7 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
     wrist_protection: Literal[0, 1, 2, 3, 4, 5, 6, 7] = 5,
   ):
     """
-    Rotate the iswap to a predifined position.
+    Rotate the iswap to a predefined position.
     Velocity units are "incr/sec"
     Acceleration units are "1_000 incr/sec**2"
     For a list of the possible positions see the pylabrobot documentation on the R0 module.
@@ -6717,7 +9131,7 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
     elif rotation_drive == STARBackend.RotationDriveOrientation.RIGHT:
       position += 30
     else:
-      raise ValueError("Invalid rotation drive orientation")
+      raise ValueError(f"Invalid rotation drive orientation: {rotation_drive}")
 
     if grip_direction == GripDirection.FRONT:
       position += 1
@@ -6816,14 +9230,14 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
       ga=collision_control_level,
       xe=f"{acceleration_index_high_acc} {acceleration_index_low_acc}",
     )
-    # Once the command has completed successfuly, set _iswap_parked to false
+    # Once the command has completed successfully, set _iswap_parked to false
     self._iswap_parked = False
     return command_output
 
   async def collapse_gripper_arm(
     self,
     minimum_traverse_height_at_beginning_of_a_command: int = 3600,
-    iswap_fold_up_sequence_at_the_end_of_process: bool = True,
+    iswap_fold_up_sequence_at_the_end_of_process: bool = False,
   ):
     """Collapse gripper arm
 
@@ -6831,7 +9245,7 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
       minimum_traverse_height_at_beginning_of_a_command: Minimum traverse height at beginning of a
                                                          command 0.1mm]. Must be between 0 and 3600.
                                                          Default 3600.
-      iswap_fold_up_sequence_at_the_end_of_process: fold up sequence at the end of process. Default True.
+      iswap_fold_up_sequence_at_the_end_of_process: fold up sequence at the end of process. Default False.
     """
 
     assert (
@@ -7006,7 +9420,7 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
     resp = await self.send_command(module="C0", command="QP", fmt="ph#")
     return resp is not None and resp["ph"] == 1
 
-  async def request_iswap_position(self):
+  async def request_iswap_position(self) -> Coordinate:
     """Request iSWAP position ( grip center )
 
     Returns:
@@ -7019,10 +9433,19 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
     """
 
     resp = await self.send_command(module="C0", command="QG", fmt="xs#####xd#yj####yd#zj####zd#")
-    resp["xs"] = resp["xs"] / 10
-    resp["yj"] = resp["yj"] / 10
-    resp["zj"] = resp["zj"] / 10
-    return resp
+    return Coordinate(
+      x=(resp["xs"] / 10) * (1 if resp["xd"] == 0 else -1),
+      y=(resp["yj"] / 10) * (1 if resp["yd"] == 0 else -1),
+      z=(resp["zj"] / 10) * (1 if resp["zd"] == 0 else -1),
+    )
+
+  async def iswap_rotation_drive_request_y(self) -> float:
+    """Request iSWAP rotation drive Y position (center) in mm. This is equivalent to the y location of the iSWAP module."""
+    if not self.iswap_installed:
+      raise RuntimeError("iSWAP is not installed")
+    resp = await self.send_command(module="R0", command="RY", fmt="ry##### (n)")
+    iswap_y_pos = resp["ry"][1]  # 0 = FW counter, 1 = HW counter
+    return round(STARBackend.y_drive_increment_to_mm(iswap_y_pos), 1)
 
   async def request_iswap_initialization_status(self) -> bool:
     """Request iSWAP initialization status
@@ -7094,80 +9517,418 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
   y_drive_mm_per_increment = 0.046302082
   z_drive_mm_per_increment = 0.01072765
 
+  dispensing_drive_vol_per_increment = 0.046876  # uL / increment
+  dispensing_drive_mm_per_increment = 0.002734375
+
   @staticmethod
   def mm_to_y_drive_increment(value_mm: float) -> int:
-    return round(value_mm / STAR.y_drive_mm_per_increment)
+    return round(value_mm / STARBackend.y_drive_mm_per_increment)
 
   @staticmethod
   def y_drive_increment_to_mm(value_mm: int) -> float:
-    return round(value_mm * STAR.y_drive_mm_per_increment, 2)
+    return round(value_mm * STARBackend.y_drive_mm_per_increment, 2)
 
   @staticmethod
   def mm_to_z_drive_increment(value_mm: float) -> int:
-    return round(value_mm / STAR.z_drive_mm_per_increment)
+    return round(value_mm / STARBackend.z_drive_mm_per_increment)
 
   @staticmethod
   def z_drive_increment_to_mm(value_increments: int) -> float:
-    return round(value_increments * STAR.z_drive_mm_per_increment, 2)
+    return round(value_increments * STARBackend.z_drive_mm_per_increment, 2)
 
-  async def clld_probe_z_height_using_channel(
+  # Dispensing drive conversions
+  # --- uL <-> increments ---
+  @staticmethod
+  def dispensing_drive_vol_to_increment(volume: float) -> int:
+    return round(volume / STARBackend.dispensing_drive_vol_per_increment)
+
+  @staticmethod
+  def dispensing_drive_increment_to_volume(position_increment: int) -> float:
+    return round(position_increment * STARBackend.dispensing_drive_vol_per_increment, 1)
+
+  # --- mm <-> increments ---
+  @staticmethod
+  def dispensing_drive_mm_to_increment(position_mm: float) -> int:
+    return round(position_mm / STARBackend.dispensing_drive_mm_per_increment)
+
+  @staticmethod
+  def dispensing_drive_increment_to_mm(position_increment: int) -> float:
+    return round(position_increment * STARBackend.dispensing_drive_mm_per_increment, 3)
+
+  # --- uL <-> mm ---
+  @staticmethod
+  def dispensing_drive_vol_to_mm(vol: float) -> float:
+    inc = STARBackend.dispensing_drive_vol_to_increment(vol)
+    return STARBackend.dispensing_drive_increment_to_mm(inc)
+
+  @staticmethod
+  def dispensing_drive_mm_to_vol(position_mm: float) -> float:
+    inc = STARBackend.dispensing_drive_mm_to_increment(position_mm)
+    return STARBackend.dispensing_drive_increment_to_volume(inc)
+
+  async def clld_probe_x_position_using_channel(
+    self,
+    channel_idx: int,  # 0-based indexing of channels!
+    probing_direction: Literal["right", "left"],
+    end_pos_search: Optional[float] = None,  # mm
+    post_detection_dist: float = 2.0,  # mm,
+    tip_bottom_diameter: float = 1.2,  # mm
+    read_timeout=240.0,  # seconds
+  ) -> float:
+    """
+    Probe the x-position of a conductive material using a channel's capacitive liquid
+    level detection (cLLD) via a lateral X scan.
+
+    Starting from the channel's current X position, the channel is moved laterally in
+    the specified direction using the XL command until cLLD triggers or the configured
+    end position is reached. After the scan, the channel is retracted inward by
+    `post_detection_dist`.
+
+    The returned value is a first-order geometric estimate of the material boundary,
+    corrected by half the tip bottom diameter assuming cylindrical tip contact.
+
+    Notes:
+    - The XL command does not report whether cLLD triggered; reaching the end position is indistinguishable from a successful detection.
+    - This function assumes cLLD triggers before `end_pos_search`.
+
+    Preconditions:
+    - The channel must already be at a Z height safe for lateral X motion.
+    - The current X position must be consistent with `probing_direction`.
+
+    Side effects:
+    - Moves the specified channel in X.
+    - Leaves the channel retracted from the detected object.
+
+    Returns:
+      Estimated x-position of the detected material boundary in millimeters.
+    """
+
+    assert channel_idx in range(
+      self.num_channels
+    ), f"Channel index must be between 0 and {self.num_channels - 1}, is {channel_idx}."
+    assert probing_direction in [
+      "right",
+      "left",
+    ], f"Probing direction must be either 'right' or 'left', is {probing_direction}."
+    assert post_detection_dist >= 0.0, (
+      f"Post-detection distance must be non-negative, is {post_detection_dist} mm."
+      "(always marks a movement away from the detected material)."
+    )
+
+    # TODO: Anti-channel-crash feature -> use self.deck with recursive logic
+    current_x_position = await self.request_x_pos_channel_n(channel_idx)
+    # y_position = await self.request_y_pos_channel_n(channel_idx)
+    # current_z_position = await self.request_z_pos_channel_n(channel_idx)
+
+    # Use identified rail number to calculate possible upper limit:
+    # STAR = 95 - 1415 mm, STARlet = 95 - 800mm
+    num_rails = self.extended_conf["xt"]
+    track_width = 22.5  # mm
+    reachable_dist_to_last_rail = 125.0
+
+    max_safe_upper_x_pos = num_rails * track_width + reachable_dist_to_last_rail
+    max_safe_lower_x_pos = 95.0  # unit: mm
+
+    if end_pos_search is None:
+      if probing_direction == "right":
+        end_pos_search = max_safe_upper_x_pos
+      else:  # probing_direction == "left"
+        end_pos_search = max_safe_lower_x_pos
+    else:
+      assert max_safe_lower_x_pos <= end_pos_search <= max_safe_upper_x_pos, (
+        f"End position for x search must be between "
+        f"{max_safe_lower_x_pos} and {max_safe_upper_x_pos} mm, "
+        f"is {end_pos_search} mm."
+      )
+
+    # Assert probing direction matches start and end positions
+    if probing_direction == "right":
+      assert current_x_position < end_pos_search, (
+        f"Current position ({current_x_position} mm) must be less than "
+        + f"end position ({end_pos_search} mm) when probing right."
+      )
+    else:  # probing_direction == "left"
+      assert current_x_position > end_pos_search, (
+        f"Current position ({current_x_position} mm) must be greater than "
+        + f"end position ({end_pos_search} mm) when probing left."
+      )
+
+    # Move channel in x until cLLD (Note: does not return detected x-position!)
+    await self.send_command(
+      module="C0",
+      command="XL",
+      xs=f"{int(round(end_pos_search * 10)):05}",
+      read_timeout=read_timeout,
+    )
+
+    sensor_triggered_x_pos = await self.request_x_pos_channel_n(channel_idx)
+
+    # Move channel post-detection
+    if probing_direction == "left":
+      final_x_pos = sensor_triggered_x_pos + post_detection_dist
+
+      # tip_bottom_diameter geometric correction assuming cylindrical tip contact
+      material_x_pos = sensor_triggered_x_pos - tip_bottom_diameter / 2
+
+    else:  # probing_direction == "right"
+      final_x_pos = sensor_triggered_x_pos - post_detection_dist
+
+      material_x_pos = sensor_triggered_x_pos + tip_bottom_diameter / 2
+
+    # Move away from detected object to avoid mechanical interference
+    # e.g. touch carrier, then carrier moves -> friction on channel!
+    await self.move_channel_x(x=final_x_pos, channel=channel_idx)
+
+    return round(material_x_pos, 1)
+
+  async def clld_probe_y_position_using_channel(
+    self,
+    channel_idx: int,  # 0-based indexing of channels!
+    probing_direction: Literal["forward", "backward"],
+    start_pos_search: Optional[float] = None,  # mm
+    end_pos_search: Optional[float] = None,  # mm
+    channel_speed: float = 10.0,  # mm/sec
+    channel_acceleration_int: Literal[1, 2, 3, 4] = 4,  # * 5_000 steps/sec**2 == 926 mm/sec**2
+    detection_edge: int = 10,
+    current_limit_int: Literal[1, 2, 3, 4, 5, 6, 7] = 7,
+    post_detection_dist: float = 2.0,  # mm,
+    tip_bottom_diameter: float = 1.2,  # mm
+  ) -> float:
+    """
+    Probe the y-position of a conductive material using the channel's capacitive Liquid Level
+    Detection (cLLD).
+
+    This method carefully moves a specified STAR channel along the y-axis to detect the presence
+    of a conductive surface. It uses STAR's built-in capacitive sensing to measure where the
+    needle tip first encounters the material, applying safety checks to prevent channel collisions
+    with adjacent channels. After detection, the channel is retracted by a configurable safe
+    distance (`post_detection_dist`) to avoid mechanical interference.
+
+    By default, the parameter `tip_bottom_diameter` assumes STAR's **integrated teaching needles**,
+    which feature an extended, straight bottom section. The correction accounts for the needle's
+    geometry by adjusting the final reported material y-position to represent the material center
+    rather than the conductive detection edge. If you are using different tips or needle designs
+    (e.g., conical tips or third-party teaching needles), you should adapt the
+    `tip_bottom_diameter` value to reflect their actual geometry.
+
+    Args:
+      channel_idx: Index of the channel to probe (0-based). The backmost channel is 0.
+      probing_direction: Direction of probing:
+        - "forward" decreases y-position,
+        - "backward" increases y-position.
+      start_pos_search: Initial y-position for the search (in mm). If not set, defaults to the current channel y-position.
+      end_pos_search: Final y-position for the search (in mm). If not set, defaults to the maximum safe travel range.
+      channel_speed: Channel movement speed during probing (mm/sec). Defaults to 10.0 mm/sec.
+      channel_acceleration_int: Acceleration ramp setting [1-4], where the physical acceleration is `value * 5,000 steps/sec**2`. Defaults to 4.
+      detection_edge: Edge steepness for capacitive detection [0-1024]. Defaults to 10.
+      current_limit_int: Current limit setting [1-7]. Defaults to 7.
+      post_detection_dist: Retraction distance after detection (in mm). Defaults to 2.0 mm.
+      tip_bottom_diameter: Effective diameter of the needle/tip bottom (in mm).  Defaults to 1.2 mm, corresponding to STAR's integrated teaching needles.
+
+    Returns:
+      The corrected y-position (in mm) of the detected conductive material, adjusted for the specified `tip_bottom_diameter`.
+
+    Raises:
+      ValueError:
+        - If `probing_direction` is invalid.
+        - If `start_pos_search` or `end_pos_search` is outside the safe range.
+        - If the configured end position conflicts with the probing direction.
+        - If no conductive material is detected.
+    """
+
+    assert probing_direction in [
+      "forward",
+      "backward",
+    ], f"Probing direction must be either 'forward' or 'backward', is {probing_direction}."
+
+    # Anti-channel-crash feature
+    if channel_idx > 0:
+      channel_idx_minus_one_y_pos = await self.request_y_pos_channel_n(channel_idx - 1)
+    else:
+      channel_idx_minus_one_y_pos = (
+        STARBackend.y_drive_increment_to_mm(13_714) + 9
+      )  # y-position=635 mm
+    if channel_idx < (self.num_channels - 1):
+      channel_idx_plus_one_y_pos = await self.request_y_pos_channel_n(channel_idx + 1)
+    else:
+      channel_idx_plus_one_y_pos = 6
+      # Insight: STAR machines appear to lose connection to a channel below y-position=6 mm
+
+    max_safe_upper_y_pos = channel_idx_minus_one_y_pos - 9
+    max_safe_lower_y_pos = channel_idx_plus_one_y_pos + 9 if channel_idx_plus_one_y_pos != 0 else 6
+
+    # Enable safe start and end positions
+    if start_pos_search:
+      assert max_safe_lower_y_pos <= start_pos_search <= max_safe_upper_y_pos, (
+        f"Start position for y search must be between \n{max_safe_lower_y_pos} and "
+        + f"{max_safe_upper_y_pos} mm, is {end_pos_search} mm. Otherwise channel will crash."
+      )
+      await self.move_channel_y(y=start_pos_search, channel=channel_idx)
+
+    if end_pos_search:
+      assert max_safe_lower_y_pos <= end_pos_search <= max_safe_upper_y_pos, (
+        f"End position for y search must be between \n{max_safe_lower_y_pos} and "
+        + f"{max_safe_upper_y_pos} mm, is {end_pos_search} mm. Otherwise channel will crash."
+      )
+
+    # Set safe y-search end position based on the probing direction
+    current_channel_y_pos = await self.request_y_pos_channel_n(channel_idx)
+    if probing_direction == "backward":
+      max_y_search_pos = end_pos_search or max_safe_upper_y_pos
+      if max_y_search_pos < current_channel_y_pos:
+        raise ValueError(
+          f"Channel {channel_idx} cannot move forward: "
+          f"End position = {max_y_search_pos} < current position = {current_channel_y_pos}"
+          f"\nDid you mean to move forward?"
+        )
+    else:  # probing_direction == "forward"
+      max_y_search_pos = end_pos_search or max_safe_lower_y_pos
+      if max_y_search_pos > current_channel_y_pos:
+        raise ValueError(
+          f"Channel {channel_idx} cannot move forward: "
+          f"End position = {max_y_search_pos} > current position = {current_channel_y_pos}"
+          f"\nDid you mean to move backward?"
+        )
+
+    # Convert mm to increments
+    max_y_search_pos_increments = STAR.mm_to_y_drive_increment(max_y_search_pos)
+    channel_speed_increments = STAR.mm_to_y_drive_increment(channel_speed)
+
+    # Machine-compatibility check of calculated parameters
+    assert 0 <= max_y_search_pos_increments <= 13_714, (
+      "Maximum y search position must be between \n0 and"
+      + f"{STARBackend.y_drive_increment_to_mm(13_714)+9} mm, is {max_y_search_pos_increments} mm"
+    )
+    assert 20 <= channel_speed_increments <= 8_000, (
+      f"LLD search speed must be between \n{STARBackend.y_drive_increment_to_mm(20)}"
+      + f"and {STARBackend.y_drive_increment_to_mm(8_000)} mm/sec, is {channel_speed} mm/sec"
+    )
+    assert channel_acceleration_int in [1, 2, 3, 4], (
+      "Channel speed must be in [1, 2, 3, 4] (* 5_000 steps/sec**2)"
+      + f", is {channel_speed} mm/sec"
+    )
+    assert (
+      0 <= detection_edge <= 1_023
+    ), "Edge steepness at capacitive LLD detection must be between 0 and 1023"
+    assert (
+      0 <= current_limit_int <= 7
+    ), f"Current limit must be in [0, 1, 2, 3, 4, 5, 6, 7], is {channel_speed} mm/sec"
+
+    # Move channel for cLLD (Note: does not return detected y-position!)
+    await self.send_command(
+      module=STARBackend.channel_id(channel_idx),
+      command="YL",
+      ya=f"{max_y_search_pos_increments:05}",  # Maximum search position [steps]
+      gt=f"{detection_edge:04}",  # Edge steepness at capacitive LLD detection
+      gl=f"{0:04}",  # Offset after edge detection -> always 0 to measure y-pos!
+      yv=f"{channel_speed_increments:04}",  # Max speed [steps/second]
+      yr=f"{channel_acceleration_int}",  # Acceleration ramp [yr * 5_000 steps/second**2]
+      yw=f"{current_limit_int}",  # Current limit
+      read_timeout=120,  # default 30 seconds is often not enough
+    )
+
+    detected_material_y_pos = await self.request_y_pos_channel_n(channel_idx)
+
+    # Dynamically evaluate post-detection distance to avoid crashes
+    if probing_direction == "backward":
+      if channel_idx == self.num_channels - 1:  # safe default
+        adjacent_y_pos = 6.0
+      else:  # next channel
+        adjacent_y_pos = await self.request_y_pos_channel_n(channel_idx + 1)
+
+      max_safe_y_mov_dist_post_detection = detected_material_y_pos - adjacent_y_pos - 9.0
+      move_target = detected_material_y_pos - min(
+        post_detection_dist, max_safe_y_mov_dist_post_detection
+      )
+
+    else:  # probing_direction == "forward"
+      if channel_idx == 0:  # safe default
+        adjacent_y_pos = STARBackend.y_drive_increment_to_mm(13_714) + 9  # y-position=635 mm
+      else:  #  previous channel
+        adjacent_y_pos = await self.request_y_pos_channel_n(channel_idx - 1)
+
+      max_safe_y_mov_dist_post_detection = adjacent_y_pos - detected_material_y_pos - 9.0
+      move_target = detected_material_y_pos + min(
+        post_detection_dist, max_safe_y_mov_dist_post_detection
+      )
+
+    await self.move_channel_y(y=move_target, channel=channel_idx)
+
+    # Correct for tip_bottom_diameter
+    if probing_direction == "backward":
+      material_y_pos = detected_material_y_pos + tip_bottom_diameter / 2
+    else:  # probing_direction == "forward"
+      material_y_pos = detected_material_y_pos - tip_bottom_diameter / 2
+
+    return round(material_y_pos, 1)
+
+  async def _move_z_drive_to_liquid_surface_using_clld(
     self,
     channel_idx: int,  # 0-based indexing of channels!
     lowest_immers_pos: float = 99.98,  # mm
-    start_pos_search: float = 330.0,  # mm
+    start_pos_search: float = 334.7,  # mm
     channel_speed: float = 10.0,  # mm
     channel_acceleration: float = 800.0,  # mm/sec**2
     detection_edge: int = 10,
     detection_drop: int = 2,
     post_detection_trajectory: Literal[0, 1] = 1,
     post_detection_dist: float = 2.0,  # mm
-    move_channels_to_save_pos_after: bool = False,
-  ) -> float:
-    """Probes the Z-height below the specified channel on a Hamilton STAR liquid handling machine
-    using the channels 'capacitive Liquid Level Detection' (cLLD) capabilities.
-    N.B.: this means only conductive materials can be probed!
+  ):
+    """Move the tip on a channel to the liquid surface using capacitive LLD (cLLD).
+
+    Runs a downward capacitive liquid-level detection (cLLD) search on the specified
+    0-indexed channel. The search will not go below lowest_immers_pos. After detection,
+    the channel performs the configured post-detection move (by default retracting 2.0 mm).
+
+    This is a low level method that takes parameters in "head space", not using the tip length.
 
     Args:
-      channel_idx: The index of the channel to use for probing. Backmost channel = 0.
-      lowest_immers_pos: The lowest immersion position in mm.
-      start_pos_lld_search: The start position for z-touch search in mm.
-      channel_speed: The speed of channel movement in mm/sec.
-      channel_acceleration: The acceleration of the channel in mm/sec**2.
-      detection_edge: The edge steepness at capacitive LLD detection.
-      detection_drop: The offset after capacitive LLD edge detection.
-      post_detection_trajectory (0, 1): Movement of the channel up (1) or down (0) after
-        contacting the surface.
-      post_detection_dist: Distance to move into the trajectory after detection in mm.
-      move_channels_to_save_pos_after: Flag to move channels to a safe position after
-       operation.
+      channel_idx: Channel index (0-based).
+      lowest_immers_pos: Lowest allowed search position in mm (hard stop). Defaults to 99.98.
+      start_pos_search: Search start position in mm. If None, computed from tip length.
+      channel_speed: Search speed in mm/s. Defaults to 10.0.
+      channel_acceleration: Search acceleration in mm/s^2. Defaults to 800.0.
+      detection_edge: Edge steepness threshold for cLLD detection (0-1023). Defaults to 10.
+      detection_drop: Offset applied after cLLD edge detection (0-1023). Defaults to 2.
+      post_detection_trajectory: Instrument post-detection move mode (0 or 1). Defaults to 1.
+      post_detection_dist: Distance in mm to move after detection (interpreted per trajectory).
+        Defaults to 2.0.
 
-    Returns:
-      The detected Z-height in mm.
+    Raises:
+      ValueError: If channel_idx is out of range.
+      RuntimeError: If no tip is mounted on channel_idx.
+      AssertionError: If any parameter is outside the instrument-supported range.
     """
 
-    lowest_immers_pos_increments = STAR.mm_to_z_drive_increment(lowest_immers_pos)
-    start_pos_search_increments = STAR.mm_to_z_drive_increment(start_pos_search)
-    channel_speed_increments = STAR.mm_to_z_drive_increment(channel_speed)
-    channel_acceleration_thousand_increments = STAR.mm_to_z_drive_increment(
+    # Preconditions checks
+    # Ensure valid channel index
+    if not isinstance(channel_idx, int) or not (0 <= channel_idx <= self.num_channels - 1):
+      raise ValueError(f"channel_idx must be in [0, {self.num_channels - 1}], is {channel_idx}")
+
+    # Conversions & machine-compatibility check of parameters
+    lowest_immers_pos_increments = STARBackend.mm_to_z_drive_increment(lowest_immers_pos)
+    start_pos_search_increments = STARBackend.mm_to_z_drive_increment(start_pos_search)
+    channel_speed_increments = STARBackend.mm_to_z_drive_increment(channel_speed)
+    channel_acceleration_thousand_increments = STARBackend.mm_to_z_drive_increment(
       channel_acceleration / 1000
     )
-    post_detection_dist_increments = STAR.mm_to_z_drive_increment(post_detection_dist)
+    post_detection_dist_increments = STARBackend.mm_to_z_drive_increment(post_detection_dist)
 
     assert 9_320 <= lowest_immers_pos_increments <= 31_200, (
-      f"Lowest immersion position must be between \n{STAR.z_drive_increment_to_mm(9_320)}"
-      + f" and {STAR.z_drive_increment_to_mm(31_200)} mm, is {lowest_immers_pos} mm"
+      f"Lowest immersion position must be between \n{STARBackend.z_drive_increment_to_mm(9_320)}"
+      + f" and {STARBackend.z_drive_increment_to_mm(31_200)} mm, is {lowest_immers_pos} mm"
     )
     assert 9_320 <= start_pos_search_increments <= 31_200, (
-      f"Start position of LLD search must be between \n{STAR.z_drive_increment_to_mm(9_320)}"
-      + f" and {STAR.z_drive_increment_to_mm(31_200)} mm, is {start_pos_search} mm"
+      f"Start position of LLD search must be between \n{STARBackend.z_drive_increment_to_mm(9_320)}"
+      + f" and {STARBackend.z_drive_increment_to_mm(31_200)} mm, is {start_pos_search} mm"
     )
     assert 20 <= channel_speed_increments <= 15_000, (
-      f"LLD search speed must be between \n{STAR.z_drive_increment_to_mm(20)}"
-      + f"and {STAR.z_drive_increment_to_mm(15_000)} mm/sec, is {channel_speed} mm/sec"
+      f"LLD search speed must be between \n{STARBackend.z_drive_increment_to_mm(20)}"
+      + f"and {STARBackend.z_drive_increment_to_mm(15_000)} mm/sec, is {channel_speed} mm/sec"
     )
     assert 5 <= channel_acceleration_thousand_increments <= 150, (
-      f"Channel acceleration must be between \n{STAR.z_drive_increment_to_mm(5*1_000)} "
-      + f" and {STAR.z_drive_increment_to_mm(150*1_000)} mm/sec**2, is {channel_acceleration} mm/sec**2"
+      f"Channel acceleration must be between \n{STARBackend.z_drive_increment_to_mm(5*1_000)} "
+      + f" and {STARBackend.z_drive_increment_to_mm(150*1_000)} mm/sec**2, is {channel_acceleration} mm/sec**2"
     )
     assert (
       0 <= detection_edge <= 1_023
@@ -7177,84 +9938,597 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
     ), "Offset after capacitive LLD edge detection must be between 0 and 1023"
     assert 0 <= post_detection_dist_increments <= 9_999, (
       "Post cLLD-detection movement distance must be between \n0"
-      + f" and {STAR.z_drive_increment_to_mm(9_999)} mm, is {post_detection_dist} mm"
+      + f" and {STARBackend.z_drive_increment_to_mm(9_999)} mm, is {post_detection_dist} mm"
     )
-
-    lowest_immers_pos_str = f"{lowest_immers_pos_increments:05}"
-    start_pos_search_str = f"{start_pos_search_increments:05}"
-    channel_speed_str = f"{channel_speed_increments:05}"
-    channel_acc_str = f"{channel_acceleration_thousand_increments:03}"
-    detection_edge_str = f"{detection_edge:04}"
-    detection_drop_str = f"{detection_drop:04}"
-    post_detection_dist_str = f"{post_detection_dist_increments:04}"
 
     await self.send_command(
-      module=STAR.channel_id(channel_idx),
+      module=STARBackend.channel_id(channel_idx),
       command="ZL",
-      zh=lowest_immers_pos_str,  # Lowest immersion position [increment]
-      zc=start_pos_search_str,  # Start position of LLD search [increment]
-      zl=channel_speed_str,  # Speed of channel movement
-      zr=channel_acc_str,  # Acceleration [1000 increment/second^2]
-      gt=detection_edge_str,  # Edge steepness at capacitive LLD detection
-      gl=detection_drop_str,  # Offset after capacitive LLD edge detection
+      zh=f"{lowest_immers_pos_increments:05}",  # Lowest immersion position [increment]
+      zc=f"{start_pos_search_increments:05}",  # Start position of LLD search [increment]
+      zl=f"{channel_speed_increments:05}",  # Speed of channel movement
+      zr=f"{channel_acceleration_thousand_increments:03}",  # Acceleration [1000 increment/second^2]
+      gt=f"{detection_edge:04}",  # Edge steepness at capacitive LLD detection
+      gl=f"{detection_drop:04}",  # Offset after capacitive LLD edge detection
       zj=post_detection_trajectory,  # Movement of the channel after contacting surface
-      zi=post_detection_dist_str,  # Distance to move up after detection [increment]
+      zi=f"{post_detection_dist_increments:04}",  # Distance to move up after detection [increment]
     )
-    if move_channels_to_save_pos_after:
-      await self.move_all_channels_in_z_safety()
 
-    get_llds = await self.request_pip_height_last_lld()
-    result_in_mm = float(get_llds["lh"][channel_idx] / 10)
-
-    return result_in_mm
-
-  async def request_tip_len_on_channel(
+  async def clld_probe_z_height_using_channel(
     self,
     channel_idx: int,  # 0-based indexing of channels!
+    lowest_immers_pos: float = 99.98,
+    start_pos_search: Optional[float] = None,
+    channel_speed: float = 10.0,
+    channel_acceleration: float = 800.0,
+    detection_edge: int = 10,
+    detection_drop: int = 2,
+    post_detection_trajectory: Literal[0, 1] = 1,
+    post_detection_dist: float = 2.0,
+    move_channels_to_safe_pos_after: bool = False,
   ) -> float:
+    """Probe the liquid surface Z-height using a channel's capacitive LLD (cLLD).
+
+    Uses the specified channel to perform a downward cLLD search and returns the
+    last liquid level detected by the instrument for that channel.
+
+    This helper is responsible for:
+      - Ensuring a tip is mounted on the chosen channel.
+      - Reading the mounted tip length and applying the fixed fitting depth (8 mm)
+        to convert *tip-referenced* Z positions (C0-style coordinates) into the
+        channel Z-drive coordinates required by the firmware `ZL` cLLD command.
+      - Optionally moving channels to a Z-safe position after probing.
+
+    Note:
+      cLLD requires a conductive target (e.g., conductive liquid / surface).
+
+    Args:
+      channel_idx: Channel index to probe with (0-based; backmost channel = 0).
+      lowest_immers_pos: Lowest allowed search position in mm, expressed in the *tip-referenced* coordinate system (i.e., the position you would use for commands that include tip length). Internally converted to channel Z-drive coordinates before issuing `ZL`.
+      start_pos_search: Start position for the cLLD search in mm, expressed in the *tip-referenced* coordinate system. Internally converted to channel Z-drive coordinates before issuing `ZL`. If None, the highest safe position is used based on tip length.
+      channel_speed: Search speed in mm/s. Defaults to 10.0.
+      channel_acceleration: Search acceleration in mm/s^2. Defaults to 800.0.
+      detection_edge: Edge steepness threshold for cLLD detection (0-1023). Defaults to 10.
+      detection_drop: Offset applied after cLLD edge detection (0-1023). Defaults to 2.
+      post_detection_trajectory: Firmware post-detection move mode (0 or 1). Defaults to 1.
+      post_detection_dist: Distance in mm to move after detection (interpreted per trajectory).  Defaults to 2.0.
+      move_channels_to_safe_pos_after: If True, moves all channels to a Z-safe position after the probing sequence completes.
+
+    Raises:
+      RuntimeError: If no tip is mounted on `channel_idx`.
+      ValueError: If the computed start position is outside the allowed safe range.
+      STARFirmwareError: If the firmware reports an error during cLLD (channels are moved to Z-safe before re-raising).
+
+    Returns:
+      The detected liquid surface Z-height in mm as reported by `request_pip_height_last_lld()` for `channel_idx`.
     """
-    Measures the length of the tip attached to the specified pipetting channel.
-    Checks if a tip is present on the given channel. If present, moves all channels
-    to THE safe Z position, 334.3 mm, measures the tip bottom Z-coordinate, and calculates
-    the total tip length. Supports tips of lengths 50.4 mm, 59.9 mm, and 95.1 mm.
-    Raises an error if the tip length is unsupported or if no tip is present.
+
+    # Ensure tip is mounted
+    tip_presence = await self.request_tip_presence()
+    if not tip_presence[channel_idx]:
+      raise RuntimeError(f"No tip mounted on channel {channel_idx}")
+
+    # Compute the highest position the tip can start the search from based on the known highest head position
+    tip_len = await self.request_tip_len_on_channel(channel_idx)
+    safe_tip_top_z_pos = (
+      STARBackend.MAXIMUM_CHANNEL_Z_POSITION - tip_len + STARBackend.DEFAULT_TIP_FITTING_DEPTH
+    )  # head space -> tip space
+
+    if start_pos_search is None:
+      start_pos_search = safe_tip_top_z_pos
+
+    # Check if lowest_immers_pos is allowed
+    if lowest_immers_pos < STARBackend.MINIMUM_CHANNEL_Z_POSITION:
+      raise ValueError(f"lowest_immers_pos must be at least 99.98 mm but is {lowest_immers_pos} mm")
+
+    # Correct for tip length + fitting depth (low level command is in head space, we are in tip space)
+    lowest_immers_pos_head_space = (
+      lowest_immers_pos + tip_len - STARBackend.DEFAULT_TIP_FITTING_DEPTH
+    )  # tip space -> head space
+    channel_head_start_pos = round(
+      start_pos_search + tip_len - STARBackend.DEFAULT_TIP_FITTING_DEPTH, 2
+    )
+
+    # Check that start position is within allowed range
+    if not (lowest_immers_pos <= start_pos_search <= safe_tip_top_z_pos):
+      raise ValueError(
+        f"Start position of LLD search must be between \n{lowest_immers_pos} and {safe_tip_top_z_pos} mm, is {start_pos_search} mm"
+      )
+
+    try:
+      await self._move_z_drive_to_liquid_surface_using_clld(
+        channel_idx=channel_idx,
+        lowest_immers_pos=lowest_immers_pos_head_space,
+        start_pos_search=channel_head_start_pos,
+        channel_speed=channel_speed,
+        channel_acceleration=channel_acceleration,
+        detection_edge=detection_edge,
+        detection_drop=detection_drop,
+        post_detection_trajectory=post_detection_trajectory,
+        post_detection_dist=post_detection_dist,
+      )
+    except STARFirmwareError:
+      await self.move_all_channels_in_z_safety()
+      raise
+
+    if move_channels_to_safe_pos_after:
+      await self.move_all_channels_in_z_safety()
+
+    current_absolute_liquid_heights = await self.request_pip_height_last_lld()
+    return current_absolute_liquid_heights[channel_idx]
+
+  async def _search_for_surface_using_plld(
+    self,
+    channel_idx: int,  # 0-based indexing of channels!
+    lowest_immers_pos: float = 99.98,  # mm of the head_probe!
+    start_pos_search: float = 334.7,  # mm of the head_probe!
+    channel_speed_above_start_pos_search: float = 120.0,  # mm/sec
+    channel_speed: float = 10.0,  # mm
+    channel_acceleration: float = 800.0,  # mm/sec**2
+    z_drive_current_limit: int = 3,
+    tip_has_filter: bool = False,
+    dispense_drive_speed: float = 5.0,  # mm/sec
+    dispense_drive_acceleration: float = 0.2,  # mm/sec**2
+    dispense_drive_max_speed: float = 14.5,  # mm/sec
+    dispense_drive_current_limit: int = 3,
+    plld_detection_edge: int = 30,
+    plld_detection_drop: int = 10,
+    clld_verification: bool = False,  # cLLD Verification feature
+    clld_detection_edge: int = 10,  # cLLD Verification feature
+    clld_detection_drop: int = 2,  # cLLD Verification feature
+    max_delta_plld_clld: float = 5.0,  # cLLD Verification feature; mm
+    plld_mode: Optional[PressureLLDMode] = None,  # Foam feature
+    plld_foam_detection_drop: int = 30,  # Foam feature
+    plld_foam_detection_edge_tolerance: int = 30,  # Foam feature
+    plld_foam_ad_values: int = 30,  # Foam feature; unknown unit
+    plld_foam_search_speed: float = 10.0,  # Foam feature; mm/sec
+    dispense_back_plld_volume: Optional[float] = None,  # uL
+    post_detection_trajectory: Literal[0, 1] = 1,
+    post_detection_dist: float = 2.0,  # mm
+  ) -> Tuple[float, float]:
+    """Search a surface using pressured-based liquid level detection (pLLD)
+    (1) with or (2) without additional cLLD verification, and (a) with foam detection sub-mode or
+    (b) without foam detection sub-mode.
+
+    Notes:
+    - This command is implemented  via the PX command module, i.e. it IS parallelisable
+    - lowest_immers_pos & start_pos_search refer to the head_probe z-coordinate (not the tip)
+    - The return values represent head_probe z-positions (not the tip) in mm
+
+    Args:
+      lowest_immers_pos: Lowest allowed Z during the search (mm). Default 99.98.
+      start_pos_search: Z position where the search begins (mm). Default 334.7.
+      channel_speed_above_start_pos_search: Z speed above the start position (mm/s). Default 120.0.
+      channel_speed: Z search speed (mm/s). Default 10.0.
+      channel_acceleration: Z acceleration (mm/s**2). Default 800.0.
+      z_drive_current_limit: Z drive current limit (instrument units). Default 3.
+      tip_has_filter: Whether a filter tip is mounted. Default False.
+      dispense_drive_speed: Dispense drive speed (mm/s). Default 5.0.
+      dispense_drive_acceleration: Dispense drive acceleration (mm/s**2). Default 0.2.
+      dispense_drive_max_speed: Dispense drive max speed (mm/s). Default 14.5.
+      dispense_drive_current_limit: Dispense drive current limit (instrument units). Default 3.
+      plld_detection_edge: Pressure detection edge threshold. Default 30.
+      plld_detection_drop: Pressure detection drop threshold. Default 10.
+      clld_verification: Activates cLLD sensing concurrently with the pressure probing. Note: cLLD
+        measurement itself cannot be retrieved. Instead it can be used for other applications, including
+        (1) verification of the surface level detected by pLLD based on max_delta_plld_clld,
+        (2) detection of foam (more easily triggers cLLD), if desired, causing an error.
+        This activates all cLLD-specific arguments. Default False.
+      max_delta_plld_clld: Max allowed delta between pressure/capacitive detections (mm). Default 5.0.
+      clld_detection_edge: Capacitive detection edge threshold. Default 10.
+      clld_detection_drop: Capacitive detection drop threshold. Default 2.
+      plld_mode: Pressure-detection sub-mode (instrument-defined). Default None.
+      plld_foam_detection_drop: Foam detection drop threshold. Default 30.
+      plld_foam_detection_edge_tolerance: Foam detection edge tolerance. Default 30.
+      plld_foam_ad_values: Foam AD values (instrument units). Default 30.
+      plld_foam_search_speed: Foam search speed (mm/s). Default 10.0.
+      dispense_back_plld_volume: Optional dispense-back volume after detection (uL). Default None.
+      post_detection_trajectory: Post-detection movement pattern selector. Default 1.
+      post_detection_dist: Post-detection movement distance (mm). Default 2.0.
+
+    Returns:
+      Two z-coordinates (mm), head_probe, meaning depends on the selected pressure sub-mode:
+      - Single-detection modes/PressureLLDMode.LIQUID: (liquid_level_pos, 0)
+      - Two-detection modes/PressureLLDMode.FOAM: (first_detection_pos, liquid_level_pos)
+    """
+
+    # Preconditions checks
+    # Ensure valid channel index
+    if not isinstance(channel_idx, int) or not (0 <= channel_idx <= self.num_channels - 1):
+      raise ValueError(f"channel_idx must be in [0, {self.num_channels - 1}], is {channel_idx}")
+
+    if plld_mode is None:
+      plld_mode = self.PressureLLDMode.LIQUID
+
+    if dispense_back_plld_volume is None:
+      dispense_back_plld_volume_mode = 0
+      dispense_back_plld_volume_increments = 0
+    else:
+      dispense_back_plld_volume_mode = 1
+      dispense_back_plld_volume_increments = STARBackend.dispensing_drive_vol_to_increment(
+        dispense_back_plld_volume
+      )
+
+    # Conversions to machine units
+    lowest_immers_pos_increments = STARBackend.mm_to_z_drive_increment(lowest_immers_pos)
+    start_pos_search_increments = STARBackend.mm_to_z_drive_increment(start_pos_search)
+
+    channel_speed_above_start_pos_search_increments = STARBackend.mm_to_z_drive_increment(
+      channel_speed_above_start_pos_search
+    )
+    channel_speed_increments = STARBackend.mm_to_z_drive_increment(channel_speed)
+    channel_acceleration_thousand_increments = STARBackend.mm_to_z_drive_increment(
+      channel_acceleration / 1000
+    )
+
+    dispense_drive_speed_increments = STARBackend.dispensing_drive_mm_to_increment(
+      dispense_drive_speed
+    )
+    dispense_drive_acceleration_increments = STARBackend.dispensing_drive_mm_to_increment(
+      dispense_drive_acceleration
+    )
+    dispense_drive_max_speed_increments = STARBackend.dispensing_drive_mm_to_increment(
+      dispense_drive_max_speed
+    )
+
+    post_detection_dist_increments = STARBackend.mm_to_z_drive_increment(post_detection_dist)
+    max_delta_plld_clld_increments = STARBackend.mm_to_z_drive_increment(max_delta_plld_clld)
+
+    plld_foam_search_speed_increments = STARBackend.mm_to_z_drive_increment(plld_foam_search_speed)
+
+    # Machine-compatibility parameter checks
+    assert 9320 <= lowest_immers_pos_increments <= 31_200, (
+      f"Lowest immersion position must be between \n{STARBackend.z_drive_increment_to_mm(9_320)}"
+      + f" and {STARBackend.z_drive_increment_to_mm(31_200)} mm, is {lowest_immers_pos} mm"
+    )
+    assert 9320 <= start_pos_search_increments <= 31_200, (
+      f"Start position of LLD search must be between \n{STARBackend.z_drive_increment_to_mm(9_320)}"
+      + f" and {STARBackend.z_drive_increment_to_mm(31_200)} mm, is {start_pos_search} mm"
+    )
+
+    assert tip_has_filter in [True, False], "tip_has_filter must be a boolean"
+
+    assert isinstance(
+      clld_verification, bool
+    ), f"clld_verification must be a boolean, is {clld_verification}"
+
+    assert plld_mode in [self.PressureLLDMode.LIQUID, self.PressureLLDMode.FOAM], (
+      f"plld_mode must be either PressureLLDMode.LIQUID ({self.PressureLLDMode.LIQUID}) or "
+      + f"PressureLLDMode.FOAM ({self.PressureLLDMode.FOAM}), is {plld_mode}"
+    )
+
+    assert 20 <= channel_speed_above_start_pos_search_increments <= 15_000, (
+      "Speed above start position of LLD search must be between \n"
+      + f"{STARBackend.z_drive_increment_to_mm(20)} and "
+      + f"{STARBackend.z_drive_increment_to_mm(15_000)} mm/sec, is "
+      + f"{channel_speed_above_start_pos_search} mm/sec"
+    )
+    assert 20 <= channel_speed_increments <= 15_000, (
+      f"LLD search speed must be between \n{STARBackend.z_drive_increment_to_mm(20)}"
+      + f"and {STARBackend.z_drive_increment_to_mm(15_000)} mm/sec, is {channel_speed} mm/sec"
+    )
+    assert 5 <= channel_acceleration_thousand_increments <= 150, (
+      f"Channel acceleration must be between \n{STARBackend.z_drive_increment_to_mm(5*1_000)} "
+      + f" and {STARBackend.z_drive_increment_to_mm(150*1_000)} mm/sec**2, is {channel_acceleration} mm/sec**2"
+    )
+    assert (
+      0 <= z_drive_current_limit <= 7
+    ), f"Z-drive current limit must be between 0 and 7, is {z_drive_current_limit}"
+
+    assert 20 <= dispense_drive_speed_increments <= 13_500, (
+      "Dispensing drive speed must be between \n"
+      + f"{STARBackend.dispensing_drive_increment_to_mm(20)} and "
+      + f"{STARBackend.dispensing_drive_increment_to_mm(13_500)} mm/sec, is {dispense_drive_speed} mm/sec"
+    )
+    assert 1 <= dispense_drive_acceleration_increments <= 100, (
+      "Dispensing drive acceleration must be between \n"
+      + f"{STARBackend.dispensing_drive_increment_to_mm(1)} and "
+      + f"{STARBackend.dispensing_drive_increment_to_mm(100)} mm/sec**2, is {dispense_drive_acceleration} mm/sec**2"
+    )
+    assert 20 <= dispense_drive_max_speed_increments <= 13_500, (
+      "Dispensing drive max speed must be between \n"
+      + f"{STARBackend.dispensing_drive_increment_to_mm(20)} and "
+      + f"{STARBackend.dispensing_drive_increment_to_mm(13_500)} mm/sec, is {dispense_drive_max_speed} mm/sec"
+    )
+    assert (
+      0 <= dispense_drive_current_limit <= 7
+    ), f"Dispensing drive current limit must be between 0 and 7, is {dispense_drive_current_limit}"
+
+    assert (
+      0 <= clld_detection_edge <= 1_023
+    ), "Edge steepness at capacitive LLD detection must be between 0 and 1023"
+    assert (
+      0 <= clld_detection_drop <= 1_023
+    ), "Offset after capacitive LLD edge detection must be between 0 and 1023"
+    assert (
+      0 <= plld_detection_edge <= 1_023
+    ), "Edge steepness at pressure LLD detection must be between 0 and 1023"
+    assert (
+      0 <= plld_detection_drop <= 1_023
+    ), "Offset after pressure LLD edge detection must be between 0 and 1023"
+
+    assert 0 <= max_delta_plld_clld_increments <= 9_999, (
+      "Maximum allowed difference between pressure LLD and capacitive LLD detection z-positions "
+      + f"must be between 0 and {STARBackend.z_drive_increment_to_mm(9_999)} mm,"
+      + f" is {max_delta_plld_clld} mm"
+    )
+
+    assert (
+      0 <= plld_foam_detection_drop <= 1_023
+    ), f"Pressure LLD foam detection drop must be between 0 and 1023, is {plld_foam_detection_drop}"
+    assert 0 <= plld_foam_detection_edge_tolerance <= 1_023, (
+      "Pressure LLD foam detection edge tolerance must be between 0 and 1023, "
+      + f"is {plld_foam_detection_edge_tolerance}"
+    )
+    assert (
+      0 <= plld_foam_ad_values <= 4_999
+    ), f"Pressure LLD foam AD values must be between 0 and 4999, is {plld_foam_ad_values}"
+    assert 20 <= plld_foam_search_speed_increments <= 13_500, (
+      "Pressure LLD foam search speed must be between \n"
+      + f"{STARBackend.z_drive_increment_to_mm(20)} and "
+      + f"{STARBackend.z_drive_increment_to_mm(13_500)} mm/sec, is {plld_foam_search_speed} mm/sec"
+    )
+
+    assert dispense_back_plld_volume_mode in [0, 1], (
+      "dispense_back_plld_volume_mode must be either 0 ('normal') or 1 "
+      + "('dispense back dispense_back_plld_volume'), "
+      + f"is {dispense_back_plld_volume_mode}"
+    )
+
+    assert 0 <= dispense_back_plld_volume_increments <= 26_666, (
+      "Dispense back pressure LLD volume must be between \n0"
+      + f" and {STARBackend.dispensing_drive_increment_to_volume(26_666)} uL, is {dispense_back_plld_volume} uL"
+    )
+
+    assert 0 <= post_detection_dist_increments <= 9_999, (
+      "Post cLLD-detection movement distance must be between \n0"
+      + f" and {STARBackend.z_drive_increment_to_mm(9_999)} mm, is {post_detection_dist} mm"
+    )
+
+    resp_raw = await self.send_command(
+      module=STARBackend.channel_id(channel_idx),
+      command="ZE",
+      zh=f"{lowest_immers_pos_increments:05}",
+      zc=f"{start_pos_search_increments:05}",
+      zi=f"{post_detection_dist_increments:04}",
+      zj=f"{post_detection_trajectory:01}",
+      gf=str(int(tip_has_filter)),
+      gt=f"{clld_detection_edge:04}",
+      gl=f"{clld_detection_drop:04}",
+      gu=f"{plld_detection_edge:04}",
+      gn=f"{plld_detection_drop:04}",
+      gm=str(int(clld_verification)),
+      gz=f"{max_delta_plld_clld_increments:04}",
+      cj=str(plld_mode.value),
+      co=f"{plld_foam_detection_drop:04}",
+      cp=f"{plld_foam_detection_edge_tolerance:04}",
+      cq=f"{plld_foam_ad_values:04}",
+      cl=f"{plld_foam_search_speed_increments:05}",
+      cc=str(dispense_back_plld_volume_mode),
+      cd=f"{dispense_back_plld_volume_increments:05}",
+      zv=f"{channel_speed_above_start_pos_search_increments:05}",
+      zl=f"{channel_speed_increments:05}",
+      zr=f"{channel_acceleration_thousand_increments:03}",
+      zw=f"{z_drive_current_limit}",
+      dl=f"{dispense_drive_speed_increments:05}",
+      dr=f"{dispense_drive_acceleration_increments:03}",
+      dv=f"{dispense_drive_max_speed_increments:05}",
+      dw=f"{dispense_drive_current_limit}",
+      read_timeout=max(self.read_timeout, 120),  # it can take long (>30s)
+    )
+    assert resp_raw is not None
+
+    resp_probe_mm = [
+      STARBackend.z_drive_increment_to_mm(int(return_val))
+      for return_val in resp_raw.split("if")[-1].split()
+    ]
+
+    # return depending on mode
+    return (
+      (resp_probe_mm[0], 0)
+      if plld_mode == self.PressureLLDMode.LIQUID
+      else (resp_probe_mm[0], resp_probe_mm[1])
+    )
+
+  async def plld_probe_z_height_using_channel(
+    self,
+    channel_idx: int,  # 0-based indexing of channels!
+    lowest_immers_pos: float = 99.98,  # mm
+    start_pos_search: Optional[float] = None,  # mm
+    channel_speed_above_start_pos_search: float = 120.0,  # mm/sec
+    channel_speed: float = 10.0,  # mm
+    channel_acceleration: float = 800.0,  # mm/sec**2
+    z_drive_current_limit: int = 3,
+    tip_has_filter: bool = False,
+    dispense_drive_speed: float = 5.0,  # mm/sec
+    dispense_drive_acceleration: float = 0.2,  # mm/sec**2
+    dispense_drive_max_speed: float = 14.5,  # mm/sec
+    dispense_drive_current_limit: int = 3,
+    plld_detection_edge: int = 30,
+    plld_detection_drop: int = 10,
+    clld_verification: bool = False,  # cLLD Verification feature
+    clld_detection_edge: int = 10,  # cLLD Verification feature
+    clld_detection_drop: int = 2,  # cLLD Verification feature
+    max_delta_plld_clld: float = 5.0,  # cLLD Verification feature; mm
+    plld_mode: Optional[PressureLLDMode] = None,  # Foam feature
+    plld_foam_detection_drop: int = 30,  # Foam feature
+    plld_foam_detection_edge_tolerance: int = 30,  # Foam feature
+    plld_foam_ad_values: int = 30,  # Foam feature; unknown unit
+    plld_foam_search_speed: float = 10.0,  # Foam feature; mm/sec
+    dispense_back_plld_volume: Optional[float] = None,  # uL
+    post_detection_trajectory: Literal[0, 1] = 1,
+    post_detection_dist: float = 2.0,  # mm
+    move_channels_to_safe_pos_after: bool = False,
+  ) -> Tuple[float, float]:
+    """Detect liquid level using pressured-based liquid level detection (pLLD)
+    (1) with or (2) without additional cLLD verification, and (a) with foam detection sub-mode or
+    (b) without foam detection sub-mode.
+
+    Notes:
+    - This command is implemented  via BOTH the PX and C0 command modules, i.e. it is NOT parallelisable!
+    - lowest_immers_pos & start_pos_search refer to the tip z-coordinate (not the head_probe)!
+    - The return values represent tip z-positions (not the head_probe) in mm!
+
+    Args:
+      lowest_immers_pos: Lowest allowed search position in mm, expressed in the *tip-referenced* coordinate system (i.e., the position you would use for commands that include tip length). Internally converted to channel Z-drive coordinates before issuing `ZL`.
+      start_pos_search: Start position for the cLLD search in mm, expressed in the *tip-referenced* coordinate system. Internally converted to channel Z-drive coordinates before issuing `ZL`. If None, the highest safe position is used based on tip length.
+      channel_speed_above_start_pos_search: Z speed above the start position (mm/s). Default 120.0.
+      channel_speed: Z search speed (mm/s). Default 10.0.
+      channel_acceleration: Z acceleration (mm/s**2). Default 800.0.
+      z_drive_current_limit: Z drive current limit (instrument units). Default 3.
+      tip_has_filter: Whether a filter tip is mounted. Default False.
+      dispense_drive_speed: Dispense drive speed (mm/s). Default 5.0.
+      dispense_drive_acceleration: Dispense drive acceleration (mm/s**2). Default 0.2.
+      dispense_drive_max_speed: Dispense drive max speed (mm/s). Default 14.5.
+      dispense_drive_current_limit: Dispense drive current limit (instrument units). Default 3.
+      plld_detection_edge: Pressure detection edge threshold. Default 30.
+      plld_detection_drop: Pressure detection drop threshold. Default 10.
+      clld_verification: Activates cLLD sensing concurrently with the pressure probing. Note: cLLD
+        measurement itself cannot be retrieved. Instead it can be used for other applications, including
+        (1) verification of the surface level detected by pLLD based on max_delta_plld_clld,
+        (2) detection of foam (more easily triggers cLLD), if desired causing and error.
+        This activates all cLLD-specific arguments. Default False.
+      clld_detection_edge: Capacitive detection edge threshold. Default 10.
+      clld_detection_drop: Capacitive detection drop threshold. Default 2.
+      max_delta_plld_clld: Max allowed delta between pressure/capacitive detections (mm). Default 5.0.
+      plld_mode: Pressure-detection sub-mode (instrument-defined). Default None.
+      plld_foam_detection_drop: Foam detection drop threshold. Default 30.
+      plld_foam_detection_edge_tolerance: Foam detection edge tolerance. Default 30.
+      plld_foam_ad_values: Foam AD values (instrument units). Default 30.
+      plld_foam_search_speed: Foam search speed (mm/s). Default 10.0.
+      dispense_back_plld_volume: Optional dispense-back volume after detection (uL). Default None.
+      post_detection_trajectory: Post-detection movement pattern selector. Default 1.
+      post_detection_dist: Post-detection movement distance (mm). Default 2.0.
+
+    Returns:
+      Two z-coordinates (mm), tip, meaning depends on the selected pressure sub-mode:
+      - Single-detection modes/PressureLLDMode.LIQUID: (liquid_level_pos, 0)
+      - Two-detection modes/PressureLLDMode.FOAM: (first_detection_pos, liquid_level_pos)
+    """
+
+    # Ensure tip is mounted
+    tip_presence = await self.request_tip_presence()
+    if not tip_presence[channel_idx]:
+      raise RuntimeError(f"No tip mounted on channel {channel_idx}")
+
+    # Compute the highest position the tip can start the search from based on the known highest head position
+    tip_len = await self.request_tip_len_on_channel(channel_idx)
+    safe_tip_top_z_pos = (
+      STARBackend.MAXIMUM_CHANNEL_Z_POSITION - tip_len + STARBackend.DEFAULT_TIP_FITTING_DEPTH
+    )  # head space -> tip space
+
+    if start_pos_search is None:
+      start_pos_search = safe_tip_top_z_pos
+
+    # Check if lowest_immers_pos is allowed
+    if lowest_immers_pos < STARBackend.MINIMUM_CHANNEL_Z_POSITION:
+      raise ValueError(f"lowest_immers_pos must be at least 99.98 mm but is {lowest_immers_pos} mm")
+
+    # Correct for tip length + fitting depth (low level command is in head space, we are in tip space)
+    lowest_immers_pos_head_space = (
+      lowest_immers_pos + tip_len - STARBackend.DEFAULT_TIP_FITTING_DEPTH
+    )  # tip space -> head space
+    channel_head_start_pos = round(
+      start_pos_search + tip_len - STARBackend.DEFAULT_TIP_FITTING_DEPTH, 2
+    )
+
+    # Check that start position is within allowed range
+    if not (lowest_immers_pos <= start_pos_search <= safe_tip_top_z_pos):
+      raise ValueError(
+        f"Start position of LLD search must be between \n{lowest_immers_pos} and {safe_tip_top_z_pos} mm, is {start_pos_search} mm"
+      )
+
+    try:
+      resp_probe_mm = await self._search_for_surface_using_plld(
+        channel_idx=channel_idx,
+        lowest_immers_pos=lowest_immers_pos_head_space,
+        start_pos_search=channel_head_start_pos,
+        channel_speed_above_start_pos_search=channel_speed_above_start_pos_search,
+        channel_speed=channel_speed,
+        channel_acceleration=channel_acceleration,
+        z_drive_current_limit=z_drive_current_limit,
+        tip_has_filter=tip_has_filter,
+        dispense_drive_speed=dispense_drive_speed,
+        dispense_drive_acceleration=dispense_drive_acceleration,
+        dispense_drive_max_speed=dispense_drive_max_speed,
+        dispense_drive_current_limit=dispense_drive_current_limit,
+        plld_detection_edge=plld_detection_edge,
+        plld_detection_drop=plld_detection_drop,
+        clld_verification=clld_verification,
+        clld_detection_edge=clld_detection_edge,
+        clld_detection_drop=clld_detection_drop,
+        max_delta_plld_clld=max_delta_plld_clld,
+        plld_mode=plld_mode,
+        plld_foam_detection_drop=plld_foam_detection_drop,
+        plld_foam_detection_edge_tolerance=plld_foam_detection_edge_tolerance,
+        plld_foam_ad_values=plld_foam_ad_values,
+        plld_foam_search_speed=plld_foam_search_speed,
+        dispense_back_plld_volume=dispense_back_plld_volume,
+        post_detection_trajectory=post_detection_trajectory,
+        post_detection_dist=post_detection_dist,
+      )
+    except STARFirmwareError:
+      await self.move_all_channels_in_z_safety()
+      raise
+
+    if plld_mode == self.PressureLLDMode.FOAM:
+      resp_tip_mm = (
+        round(resp_probe_mm[0] - tip_len + STARBackend.DEFAULT_TIP_FITTING_DEPTH, 2),
+        round(resp_probe_mm[1] - tip_len + STARBackend.DEFAULT_TIP_FITTING_DEPTH, 2),
+      )
+    else:
+      resp_tip_mm = (
+        round(resp_probe_mm[0] - tip_len + STARBackend.DEFAULT_TIP_FITTING_DEPTH, 2),
+        0.0,
+      )
+
+    if move_channels_to_safe_pos_after:
+      await self.move_all_channels_in_z_safety()
+
+    return resp_tip_mm
+
+  async def request_probe_z_position(self, channel_idx: int) -> float:
+    """Request the z-position of the channel probe (EXCLUDING the tip)"""
+    resp = await self.send_command(
+      module=self.channel_id(channel_idx), command="RZ", fmt="rz######"
+    )
+    increments = resp["rz"]
+    return self.z_drive_increment_to_mm(increments)
+
+  async def request_tip_len_on_channel(self, channel_idx: int) -> float:
+    """Measures the length of the tip attached to the specified pipetting channel.
+    Checks if a tip is present on the given channel. Raises an error if no tip is present.
+
     Parameters:
-      channel_idx: Index of the pipetting channel (0-based).
+      channel_idx: Index of the pipetting channel (0-indexed).
+
     Returns:
       The measured tip length in millimeters.
+
     Raises:
-      ValueError: If no tip is present on the channel or if the tip length is unsupported.
+      RuntimeError: If no tip is present on the channel.
     """
 
     # Check there is a tip on the channel
     all_channel_occupancy = await self.request_tip_presence()
     if not all_channel_occupancy[channel_idx]:
-      raise ValueError(f"No tip present on channel {channel_idx}")
+      raise RuntimeError(f"No tip present on channel {channel_idx}")
 
-    # Level all channels
-    await self.move_all_channels_in_z_safety()
-    known_top_position_channel_head = 334.3  # mm
+    # Request z position of probe bottom
+    probe_position = await self.request_probe_z_position(channel_idx=channel_idx)
+
+    # Request z-coordinate of probe+tip bottom
+    tip_bottom_z_coordinate = await self.request_tip_bottom_z_position(channel_idx=channel_idx)
+
     fitting_depth_of_all_standard_channel_tips = 8  # mm
-    unknown_offset_for_all_tips = 0.4  # mm
-
-    # Request z-coordinate of channel+tip bottom
-    tip_bottom_z_coordinate = await self.request_z_pos_channel_n(
-      pipetting_channel_index=channel_idx
-    )
-
-    total_tip_len = round(
-      known_top_position_channel_head
-      - (
-        tip_bottom_z_coordinate
-        - fitting_depth_of_all_standard_channel_tips
-        - unknown_offset_for_all_tips
-      ),
+    return round(
+      probe_position - (tip_bottom_z_coordinate - fitting_depth_of_all_standard_channel_tips),
       1,
     )
 
-    if total_tip_len in [50.4, 59.9, 95.1]:  # 50ul, 300ul, 1000ul
-      return total_tip_len
-    raise ValueError(f"Tip of length {total_tip_len} not yet supported")
+  MAXIMUM_CHANNEL_Z_POSITION = 334.7  # mm (= z-drive increment 31_200)
+  MINIMUM_CHANNEL_Z_POSITION = 99.98  # mm (= z-drive increment 9_320)
+  DEFAULT_TIP_FITTING_DEPTH = 8  # mm, for 10, 50, 300, 1000 ul Hamilton tips
 
   async def ztouch_probe_z_height_using_channel(
     self,
@@ -7268,7 +10542,7 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
     detection_limiter_in_PWM: int = 1,
     push_down_force_in_PWM: int = 0,
     post_detection_dist: float = 2.0,  # mm
-    move_channels_to_save_pos_after: bool = False,
+    move_channels_to_safe_pos_after: bool = False,
   ) -> float:
     """Probes the Z-height below the specified channel on a Hamilton STAR liquid handling machine
     using the channels 'z-touchoff' capabilities, i.e. a controlled triggering of the z-drive,
@@ -7286,7 +10560,7 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
       push_down_force_in_PWM: Offset PWM value for push down force.
         cf000 = No push down force, drive is switched off.
       post_detection_dist: Distance to move into the trajectory after detection in mm.
-      move_channels_to_save_pos_after: Flag to move channels to a safe position after
+      move_channels_to_safe_pos_after: Flag to move channels to a safe position after
         operation.
 
     Returns:
@@ -7309,29 +10583,29 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
       # tip_len = self.head[channel_idx].get_tip().total_tip_length
       tip_len = await self.request_tip_len_on_channel(channel_idx)
 
-    # fitting_depth = 8 mm for 10, 50, 300, 1000 ul Hamilton tips
-    # fitting_depth = self.head[channel_idx].get_tip().fitting_depth
-    fitting_depth = 8  # mm, for 10, 50, 300, 1000 ul Hamilton tips
-
     if start_pos_search is None:
-      start_pos_search = 334.7 - tip_len + fitting_depth
+      start_pos_search = (
+        STARBackend.MAXIMUM_CHANNEL_Z_POSITION - tip_len + STARBackend.DEFAULT_TIP_FITTING_DEPTH
+      )
 
-    tip_len_used_in_increments = (tip_len - fitting_depth) / STAR.z_drive_mm_per_increment
+    tip_len_used_in_increments = (
+      tip_len - STARBackend.DEFAULT_TIP_FITTING_DEPTH
+    ) / STARBackend.z_drive_mm_per_increment
     channel_head_start_pos = (
-      start_pos_search + tip_len - fitting_depth
+      start_pos_search + tip_len - STARBackend.DEFAULT_TIP_FITTING_DEPTH
     )  # start_pos of the head itself!
     safe_head_bottom_z_pos = (
-      99.98 + tip_len - fitting_depth
-    )  # 99.98 == STAR.z_drive_increment_to_mm(9_320)
-    safe_head_top_z_pos = 334.7  # 334.7 == STAR.z_drive_increment_to_mm(31_200)
+      STARBackend.MINIMUM_CHANNEL_Z_POSITION + tip_len - STARBackend.DEFAULT_TIP_FITTING_DEPTH
+    )
+    safe_head_top_z_pos = STARBackend.MAXIMUM_CHANNEL_Z_POSITION
 
-    lowest_immers_pos_increments = STAR.mm_to_z_drive_increment(lowest_immers_pos)
-    start_pos_search_increments = STAR.mm_to_z_drive_increment(channel_head_start_pos)
-    channel_speed_increments = STAR.mm_to_z_drive_increment(channel_speed)
-    channel_acceleration_thousand_increments = STAR.mm_to_z_drive_increment(
+    lowest_immers_pos_increments = STARBackend.mm_to_z_drive_increment(lowest_immers_pos)
+    start_pos_search_increments = STARBackend.mm_to_z_drive_increment(channel_head_start_pos)
+    channel_speed_increments = STARBackend.mm_to_z_drive_increment(channel_speed)
+    channel_acceleration_thousand_increments = STARBackend.mm_to_z_drive_increment(
       channel_acceleration / 1000
     )
-    channel_speed_upwards_increments = STAR.mm_to_z_drive_increment(channel_speed_upwards)
+    channel_speed_upwards_increments = STARBackend.mm_to_z_drive_increment(channel_speed_upwards)
 
     assert 0 <= channel_idx <= 15, f"channel_idx must be between 0 and 15, is {channel_idx}"
     assert 20 <= tip_len <= 120, "Total tip length must be between 20 and 120"
@@ -7345,16 +10619,16 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
       + f" and {safe_head_top_z_pos} mm, is {channel_head_start_pos} mm"
     )
     assert 20 <= channel_speed_increments <= 15_000, (
-      f"Z-touch search speed must be between \n{STAR.z_drive_increment_to_mm(20)}"
-      + f" and {STAR.z_drive_increment_to_mm(15_000)} mm/sec, is {channel_speed} mm/sec"
+      f"Z-touch search speed must be between \n{STARBackend.z_drive_increment_to_mm(20)}"
+      + f" and {STARBackend.z_drive_increment_to_mm(15_000)} mm/sec, is {channel_speed} mm/sec"
     )
     assert 5 <= channel_acceleration_thousand_increments <= 150, (
-      f"Channel acceleration must be between \n{STAR.z_drive_increment_to_mm(5*1_000)}"
-      + f" and {STAR.z_drive_increment_to_mm(150*1_000)} mm/sec**2, is {channel_speed} mm/sec**2"
+      f"Channel acceleration must be between \n{STARBackend.z_drive_increment_to_mm(5*1_000)}"
+      + f" and {STARBackend.z_drive_increment_to_mm(150*1_000)} mm/sec**2, is {channel_speed} mm/sec**2"
     )
     assert 20 <= channel_speed_upwards_increments <= 15_000, (
-      f"Channel retraction speed must be between \n{STAR.z_drive_increment_to_mm(20)}"
-      + f" and {STAR.z_drive_increment_to_mm(15_000)} mm/sec, is {channel_speed_upwards} mm/sec"
+      f"Channel retraction speed must be between \n{STARBackend.z_drive_increment_to_mm(20)}"
+      + f" and {STARBackend.z_drive_increment_to_mm(15_000)} mm/sec, is {channel_speed_upwards} mm/sec"
     )
     assert (
       0 <= detection_limiter_in_PWM <= 125
@@ -7373,7 +10647,7 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
     push_down_force_in_PWM_str = f"{push_down_force_in_PWM:03}"
 
     ztouch_probed_z_height = await self.send_command(
-      module=STAR.channel_id(channel_idx),
+      module=STARBackend.channel_id(channel_idx),
       command="ZH",
       zb=start_pos_search_str,  # begin of searching range [increment]
       za=lowest_immers_pos_str,  # end of searching range [increment]
@@ -7385,12 +10659,12 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
       fmt="rz#####",
     )
     # Subtract tip_length from measurement in increment, and convert to mm
-    result_in_mm = STAR.z_drive_increment_to_mm(
+    result_in_mm = STARBackend.z_drive_increment_to_mm(
       ztouch_probed_z_height["rz"] - tip_len_used_in_increments
     )
     if post_detection_dist != 0:  # Safety first
       await self.move_channel_z(z=result_in_mm + post_detection_dist, channel=channel_idx)
-    if move_channels_to_save_pos_after:
+    if move_channels_to_safe_pos_after:
       await self.move_all_channels_in_z_safety()
 
     return float(result_in_mm)
@@ -7399,22 +10673,30 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
     LEFT = 1
     FRONT = 2
     RIGHT = 3
+    PARKED_RIGHT = None
 
   async def rotate_iswap_rotation_drive(self, orientation: RotationDriveOrientation):
-    return await self.send_command(
-      module="R0",
-      command="WP",
-      auto_id=False,
-      wp=orientation.value,
-    )
+    if orientation in {
+      STARBackend.RotationDriveOrientation.RIGHT,
+      STARBackend.RotationDriveOrientation.FRONT,
+      STARBackend.RotationDriveOrientation.LEFT,
+    }:
+      return await self.send_command(
+        module="R0",
+        command="WP",
+        auto_id=False,
+        wp=orientation.value,
+      )
+    else:
+      raise ValueError(f"Invalid rotation drive orientation: {orientation}")
 
-  class WristOrientation(enum.Enum):
+  class WristDriveOrientation(enum.Enum):
     RIGHT = 1
     STRAIGHT = 2
     LEFT = 3
     REVERSE = 4
 
-  async def rotate_iswap_wrist(self, orientation: WristOrientation):
+  async def rotate_iswap_wrist(self, orientation: WristDriveOrientation):
     return await self.send_command(
       module="R0",
       command="TP",
@@ -7467,7 +10749,7 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
       make_space: If True, the channels will be moved to ensure they are at least 9mm apart and in
         descending order, after the channels in `ys` have been put at the desired locations. Note
         that an error may still be raised, if there is insufficient space to move the channels or
-        if the requested locations are not valid. Set this to False if you wan to aviod inadvertently
+        if the requested locations are not valid. Set this to False if you wan to avoid inadvertently
         moving other channels.
     """
 
@@ -7509,7 +10791,7 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
       raise ValueError("Channel N would hit the front of the robot")
 
     if not all(
-      int((channel_locations[i] - channel_locations[i + 1]) * 1000) >= 8_999  # float fixing
+      round((channel_locations[i] - channel_locations[i + 1]) * 1000) >= 8_990  # float fixing
       for i in range(len(channel_locations) - 1)
     ):
       raise ValueError("Channels must be at least 9mm apart and in descending order")
@@ -7576,7 +10858,7 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
 
     if isinstance(wells, Well):
       well = wells
-      x, y, z = well.get_absolute_location("c", "c", "cavity_bottom")
+      x, y, z = well.get_location_wrt(self.deck, "c", "c", "cavity_bottom")
 
       if spread == "wide":
         offsets = get_wide_single_resource_liquid_op_offsets(
@@ -7589,11 +10871,11 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
       ys = [y + offset.y for offset in offsets]
     else:
       assert (
-        len(set(w.get_absolute_location().x for w in wells)) == 1
+        len(set(w.get_location_wrt(self.deck).x for w in wells)) == 1
       ), "Wells must be on the same column"
-      absolute_center = wells[0].get_absolute_location("c", "c", "cavity_bottom")
+      absolute_center = wells[0].get_location_wrt(self.deck, "c", "c", "cavity_bottom")
       x = absolute_center.x
-      ys = [well.get_absolute_location(x="c", y="c").y for well in wells]
+      ys = [well.get_location_wrt(self.deck, x="c", y="c").y for well in wells]
       z = absolute_center.z
 
     await self.move_channel_x(0, x=x)
@@ -7638,9 +10920,9 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
     .. code-block:: python
 
         well = plate.get_well("A3")
-        await wc.lh.aspirate(
+        await lh.aspirate(
           [well]*4, vols=[100]*4, use_channels=[7,8,9,10],
-          min_z_endpos=well.get_absolute_location(z="cavity_bottom").z,
+          min_z_endpos=well.get_location_wrt(self.deck, z="cavity_bottom").z,
           surface_following_distance=0,
           pull_out_distance_transport_air=[0] * 4)
         await step_off_foil(lh.backend, [well], front_channel=11, back_channel=6, move_inwards=3)
@@ -7667,20 +10949,20 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
     plate = plates.pop()
     assert plate is not None
 
-    z_location = plate.get_absolute_location(z="top").z
+    z_location = plate.get_location_wrt(self.deck, z="top").z
 
     if plate.get_absolute_rotation().z % 360 == 0:
-      back_location = plate.get_absolute_location(y="b")
-      front_location = plate.get_absolute_location(y="f")
+      back_location = plate.get_location_wrt(self.deck, y="b")
+      front_location = plate.get_location_wrt(self.deck, y="f")
     elif plate.get_absolute_rotation().z % 360 == 90:
-      back_location = plate.get_absolute_location(x="r")
-      front_location = plate.get_absolute_location(x="l")
+      back_location = plate.get_location_wrt(self.deck, x="r")
+      front_location = plate.get_location_wrt(self.deck, x="l")
     elif plate.get_absolute_rotation().z % 360 == 180:
-      back_location = plate.get_absolute_location(y="f")
-      front_location = plate.get_absolute_location(y="b")
+      back_location = plate.get_location_wrt(self.deck, y="f")
+      front_location = plate.get_location_wrt(self.deck, y="b")
     elif plate.get_absolute_rotation().z % 360 == 270:
-      back_location = plate.get_absolute_location(x="l")
-      front_location = plate.get_absolute_location(x="r")
+      back_location = plate.get_location_wrt(self.deck, x="l")
+      front_location = plate.get_location_wrt(self.deck, x="r")
     else:
       raise ValueError("Plate rotation must be a multiple of 90 degrees")
 
@@ -7709,7 +10991,7 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
       await self.move_all_channels_in_z_safety()
 
   async def request_volume_in_tip(self, channel: int) -> float:
-    resp = await self.send_command(STAR.channel_id(channel), "QC", fmt="qc##### (n)")
+    resp = await self.send_command(STARBackend.channel_id(channel), "QC", fmt="qc##### (n)")
     _, current_volume = resp["qc"]  # first is max volume
     return float(current_volume) / 10
 
@@ -7741,10 +11023,116 @@ class STARBackend(HamiltonLiquidHandler, HamiltonHeaterShakerInterface):
     assert isinstance(resp, str)
     return resp
 
+  # ------------ STAR(RS-232/TCC1/2)-connected Hamilton Heater Cooler (HHS) -------------
+
+  async def check_type_is_hhc(self, device_number: int):
+    """
+    Convenience method to check that connected device is an HHC.
+    Executed through firmware query
+    """
+
+    firmware_version = await self.send_command(module=f"T{device_number}", command="RF")
+    if "Hamilton Heater Cooler" not in firmware_version:
+      raise ValueError(
+        f"Device number {device_number} does not connect to a Hamilton"
+        f" Heater-Cooler, found {firmware_version} instead."
+        f"Have you called the wrong device number?"
+      )
+
+  async def initialize_hhc(self, device_number: int) -> str:
+    """Initialize Hamilton Heater Cooler (HHC) at specified TCC port
+
+    Args:
+      device_number: TCC connect number to the HHC
+    """
+
+    module_pointer = f"T{device_number}"
+
+    # Request module configuration
+    try:
+      await self.send_command(module=module_pointer, command="QU")
+    except TimeoutError as exc:
+      error_message = (
+        f"No Hamilton Heater Cooler found at device_number {device_number}"
+        f", have you checked your connections? Original error: {exc}"
+      )
+      raise ValueError(error_message) from exc
+
+    await self.check_type_is_hhc(device_number)
+
+    # Request module configuration
+    hhc_init_status = await self.send_command(module=module_pointer, command="QW", fmt="qw#")
+    hhc_init_status = hhc_init_status["qw"]
+
+    info = "HHC already initialized"
+    # Initializing HHS if necessary
+    if hhc_init_status != 1:
+      # Initialize device
+      await self.send_command(module=module_pointer, command="LI")
+      info = f"HHS at device number {device_number} initialized."
+
+    return info
+
+  async def start_temperature_control_at_hhc(
+    self,
+    device_number: int,
+    temp: Union[float, int],
+  ):
+    """Start temperature regulation of specified HHC"""
+
+    await self.check_type_is_hhc(device_number)
+    assert 0 < temp <= 105
+
+    # Ensure proper temperature input handling
+    if isinstance(temp, (float, int)):
+      safe_temp_str = f"{round(temp * 10):04d}"
+    else:
+      safe_temp_str = str(temp)
+
+    return await self.send_command(
+      module=f"T{device_number}",
+      command="TA",  # temperature adjustment
+      ta=safe_temp_str,
+      tb="1800",  # TODO: identify precise purpose?
+      tc="0020",  # TODO: identify precise purpose?
+    )
+
+  async def get_temperature_at_hhc(self, device_number: int) -> dict:
+    """Query current temperatures of both sensors of specified HHC"""
+
+    await self.check_type_is_hhc(device_number)
+
+    request_temperature = await self.send_command(module=f"T{device_number}", command="RT")
+    processed_t_info = [int(x) / 10 for x in request_temperature.split("+")[-2:]]
+
+    return {
+      "middle_T": processed_t_info[0],
+      "edge_T": processed_t_info[-1],
+    }
+
+  async def query_whether_temperature_reached_at_hhc(self, device_number: int):
+    """Stop temperature regulation of specified HHC"""
+
+    await self.check_type_is_hhc(device_number)
+    query_current_control_status = await self.send_command(
+      module=f"T{device_number}", command="QD", fmt="qd#"
+    )
+
+    return query_current_control_status["qd"] == 0
+
+  async def stop_temperature_control_at_hhc(self, device_number: int):
+    """Stop temperature regulation of specified HHC"""
+
+    await self.check_type_is_hhc(device_number)
+
+    return await self.send_command(module=f"T{device_number}", command="TO")
+
+  # -------------- Extra - Probing labware with STAR - making STAR into a CMM --------------
+
 
 class UnSafe:
   """
-  Namespace for actions that are unsafe to perfom.
+  Namespace for actions that are unsafe to perform.
   For example, actions that send the iSWAP outside of the Hamilton Deck
   """
 
@@ -7907,7 +11295,7 @@ class UnSafe:
 
       Consider this method an easter egg. Not for serious use.
     """
-    await self.star.send_command(module=STAR.channel_id(channel_idx), command="SI")
+    await self.star.send_command(module=STARBackend.channel_id(channel_idx), command="SI")
 
 
 # Deprecated alias with warning # TODO: remove mid May 2025 (giving people 1 month to update)

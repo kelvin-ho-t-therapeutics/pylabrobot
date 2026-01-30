@@ -3,6 +3,7 @@ import datetime
 import logging
 import threading
 import time
+import warnings
 from abc import ABCMeta, abstractmethod
 from dataclasses import dataclass
 from typing import (
@@ -85,11 +86,16 @@ class HamiltonLiquidHandler(LiquidHandlerBackend, metaclass=ABCMeta):
     self._waiting_tasks: List[HamiltonTask] = []
     self._tth2tti: dict[int, int] = {}  # hash to tip type index
 
-    # Whether to allow the firmware to plan liquid handling operations when the y positions are
-    # equal (same container). This allows you to pass the same container to aspirate and dispense
-    # multiple times in a single call, and the onboard firmware will compute the optimal order of
-    # operations. This is useful for efficiency but may hurt protocol interoperability.
-    self.allow_firmware_planning = False
+  def __setattr__(self, name: str, value: Any) -> None:
+    if name == "allow_firmware_planning":
+      warnings.warn(
+        "allow_firmware_planning is deprecated and will be removed in a future version. "
+        "The behavior is now always enabled.",
+        DeprecationWarning,
+        stacklevel=2,
+      )
+      return
+    super().__setattr__(name, value)
 
   async def setup(self):
     await super().setup()
@@ -100,6 +106,7 @@ class HamiltonLiquidHandler(LiquidHandlerBackend, metaclass=ABCMeta):
       task.fut.set_exception(RuntimeError("Stopping HamiltonLiquidHandler."))
     self._waiting_tasks.clear()
     self._tth2tti.clear()
+    await self.io.stop()
 
   def serialize(self) -> dict:
     usb_serialized = self.io.serialize()
@@ -389,10 +396,10 @@ class HamiltonLiquidHandler(LiquidHandlerBackend, metaclass=ABCMeta):
         y_positions.append(0)
       channels_involved.append(True)
 
-      x_pos = ops[i].resource.get_absolute_location(x="c", y="c", z="b").x + ops[i].offset.x
+      x_pos = ops[i].resource.get_location_wrt(self.deck, x="c", y="c", z="b").x + ops[i].offset.x
       x_positions.append(round(x_pos * 10))
 
-      y_pos = ops[i].resource.get_absolute_location(x="c", y="c", z="b").y + ops[i].offset.y
+      y_pos = ops[i].resource.get_location_wrt(self.deck, x="c", y="c", z="b").y + ops[i].offset.y
       y_positions.append(round(y_pos * 10))
 
     # check that the minimum d between any two y positions is >9mm
@@ -405,7 +412,7 @@ class HamiltonLiquidHandler(LiquidHandlerBackend, metaclass=ABCMeta):
           continue
         if x1 != x2:  # channels not on the same column -> will be two operations on the machine
           continue
-        if not (self.allow_firmware_planning and y1 == y2) and abs(y1 - y2) < 90:
+        if y1 != y2 and abs(y1 - y2) < 90:
           raise ValueError(
             f"Minimum distance between two y positions is <9mm: {y1}, {y2}"
             f" (channel {channel_idx1} and {channel_idx2})"
@@ -472,15 +479,6 @@ class HamiltonLiquidHandler(LiquidHandlerBackend, metaclass=ABCMeta):
     if not isinstance(tip, HamiltonTip):
       raise ValueError(f"Tip {tip} is not a HamiltonTip.")
     return tip
-
-  async def get_ttti(self, tips: List[HamiltonTip]) -> List[int]:
-    """Get tip type table index for a list of tips.
-
-    Ensure that for all non-None tips, they have the same tip type, and return the tip type table
-    index for that tip type.
-    """
-
-    return [await self.get_or_assign_tip_type_index(tip) for tip in tips]
 
   async def send_raw_command(
     self,

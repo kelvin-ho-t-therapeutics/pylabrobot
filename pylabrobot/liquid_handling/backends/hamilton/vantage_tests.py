@@ -4,18 +4,20 @@ from typing import Any, List, Optional
 from pylabrobot.liquid_handling import LiquidHandler
 from pylabrobot.liquid_handling.standard import Pickup
 from pylabrobot.resources import (
-  HT,
-  LT,
   PLT_CAR_L5AC_A00,
   TIP_CAR_480_A00,
   Coordinate,
   Cor_96_wellplate_360ul_Fb,
+  hamilton_96_tiprack_10uL,
+  hamilton_96_tiprack_50uL,
+  hamilton_96_tiprack_300uL,
+  hamilton_96_tiprack_1000uL,
   set_tip_tracking,
 )
 from pylabrobot.resources.hamilton import VantageDeck
 
 from .vantage_backend import (
-  Vantage,
+  VantageBackend,
   VantageFirmwareError,
   parse_vantage_fw_string,
   vantage_response_string_to_error,
@@ -203,7 +205,7 @@ class TestVantageResponseParsing(unittest.TestCase):
     )
 
 
-class VantageCommandCatcher(Vantage):
+class VantageCommandCatcher(VantageBackend):
   """Mock backend for Vantage that catches commands and saves them instead of sending them to the
   machine."""
 
@@ -247,8 +249,8 @@ class TestVantageLiquidHandlerCommands(unittest.IsolatedAsyncioTestCase):
     self.lh = LiquidHandler(self.mockVantage, deck=self.deck)
 
     self.tip_car = TIP_CAR_480_A00(name="tip carrier")
-    self.tip_car[0] = self.tip_rack = HT(name="tip_rack_01")
-    self.tip_car[1] = self.small_tip_rack = LT(name="tip_rack_02")
+    self.tip_car[0] = self.tip_rack = hamilton_96_tiprack_1000uL(name="tip_rack_01")
+    self.tip_car[1] = self.small_tip_rack = hamilton_96_tiprack_10uL(name="tip_rack_02")
     self.deck.assign_child_resource(self.tip_car, rails=18)
 
     self.plt_car = PLT_CAR_L5AC_A00(name="plate carrier")
@@ -570,3 +572,105 @@ class TestVantageLiquidHandlerCommands(unittest.IsolatedAsyncioTestCase):
         "te": "int",
       },
     )
+
+
+class TestVantageTipPickupDropAllSizes(unittest.IsolatedAsyncioTestCase):
+  """Test Vantage tip pickup and drop Z position calculations for all tip sizes."""
+
+  async def asyncSetUp(self):
+    self.backend = VantageCommandCatcher()
+    self.deck = VantageDeck(size=1.3)
+    self.lh = LiquidHandler(self.backend, deck=self.deck)
+
+    self.tip_car = TIP_CAR_480_A00(name="tip_carrier")
+    self.deck.assign_child_resource(self.tip_car, rails=18)
+
+    await self.lh.setup()
+    set_tip_tracking(enabled=False)
+
+  async def asyncTearDown(self):
+    await self.lh.stop()
+
+  def _get_tp_tz_from_commands(self, cmd_prefix: str, fmt: dict):
+    """Extract tp and tz values from commands matching the prefix."""
+    for cmd in self.backend.commands:
+      if cmd.startswith(cmd_prefix):
+        parsed = parse_vantage_fw_string(cmd, fmt)
+        return parsed.get("tp"), parsed.get("tz")
+    return None, None
+
+  async def test_10uL_tips(self):
+    tip_rack = hamilton_96_tiprack_10uL("tips")
+    self.tip_car[1] = tip_rack
+
+    # Pickup
+    await self.lh.pick_up_tips(tip_rack["A1"])
+    tp, tz = self._get_tp_tz_from_commands("A1PMTP", PICKUP_TIP_FORMAT)
+    self.assertEqual(tp, [2224])
+    self.assertEqual(tz, [2164])
+
+    # Drop
+    self.backend.commands = []
+    await self.lh.drop_tips(tip_rack["A1"])
+    tp, tz = self._get_tp_tz_from_commands("A1PMTR", DROP_TIP_FORMAT)
+    self.assertEqual(tp, [2024])
+    self.assertEqual(tz, [1924])
+
+    tip_rack.unassign()
+
+  async def test_50uL_tips(self):
+    tip_rack = hamilton_96_tiprack_50uL("tips")
+    self.tip_car[1] = tip_rack
+
+    # Pickup
+    await self.lh.pick_up_tips(tip_rack["A1"])
+    tp, tz = self._get_tp_tz_from_commands("A1PMTP", PICKUP_TIP_FORMAT)
+    self.assertEqual(tp, [2248])
+    self.assertEqual(tz, [2168])
+
+    # Drop
+    self.backend.commands = []
+    await self.lh.drop_tips(tip_rack["A1"])
+    tp, tz = self._get_tp_tz_from_commands("A1PMTR", DROP_TIP_FORMAT)
+    self.assertEqual(tp, [1844])
+    self.assertEqual(tz, [1744])
+
+    tip_rack.unassign()
+
+  async def test_300uL_tips(self):
+    tip_rack = hamilton_96_tiprack_300uL("tips")
+    self.tip_car[1] = tip_rack
+
+    # Pickup
+    await self.lh.pick_up_tips(tip_rack["A1"])
+    tp, tz = self._get_tp_tz_from_commands("A1PMTP", PICKUP_TIP_FORMAT)
+    self.assertEqual(tp, [2244])
+    self.assertEqual(tz, [2164])
+
+    # Drop
+    self.backend.commands = []
+    await self.lh.drop_tips(tip_rack["A1"])
+    tp, tz = self._get_tp_tz_from_commands("A1PMTR", DROP_TIP_FORMAT)
+    self.assertEqual(tp, [1744])
+    self.assertEqual(tz, [1644])
+
+    tip_rack.unassign()
+
+  async def test_1000uL_tips(self):
+    tip_rack = hamilton_96_tiprack_1000uL("tips")
+    self.tip_car[1] = tip_rack
+
+    # Pickup
+    await self.lh.pick_up_tips(tip_rack["A1"])
+    tp, tz = self._get_tp_tz_from_commands("A1PMTP", PICKUP_TIP_FORMAT)
+    self.assertEqual(tp, [2266])
+    self.assertEqual(tz, [2166])
+
+    # Drop
+    self.backend.commands = []
+    await self.lh.drop_tips(tip_rack["A1"])
+    tp, tz = self._get_tp_tz_from_commands("A1PMTR", DROP_TIP_FORMAT)
+    self.assertEqual(tp, [1414])
+    self.assertEqual(tz, [1314])
+
+    tip_rack.unassign()

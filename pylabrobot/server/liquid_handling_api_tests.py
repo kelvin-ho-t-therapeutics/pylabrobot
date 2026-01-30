@@ -3,19 +3,18 @@ import time
 import unittest
 from pathlib import Path
 from typing import cast
+from unittest.mock import PropertyMock
 
 from pylabrobot import Config
 from pylabrobot.liquid_handling import LiquidHandler
-from pylabrobot.liquid_handling.backends import (
-  SerializingSavingBackend,
-)
+from pylabrobot.liquid_handling.backends.backend import LiquidHandlerBackend
 from pylabrobot.resources import (
-  HTF,
   PLT_CAR_L5AC_A00,
   TIP_CAR_480_A00,
   Cor_96_wellplate_360ul_Fb,
   Plate,
   TipRack,
+  hamilton_96_tiprack_1000uL_filter,
   no_tip_tracking,
 )
 from pylabrobot.resources.hamilton import HamiltonDeck, STARLetDeck
@@ -23,14 +22,22 @@ from pylabrobot.serializer import serialize
 from pylabrobot.server.liquid_handling_server import create_app
 
 
+def _create_mock_backend(num_channels: int = 8):
+  """Create a mock LiquidHandlerBackend with the specified number of channels."""
+  mock = unittest.mock.create_autospec(LiquidHandlerBackend, instance=True)
+  type(mock).num_channels = PropertyMock(return_value=num_channels)
+  mock.can_pick_up_tip.return_value = True
+  return mock
+
+
 def build_layout() -> HamiltonDeck:
   # copied from liquid_handler_tests.py, can we make this shared?
   tip_car = TIP_CAR_480_A00(name="tip_carrier")
-  tip_car[0] = HTF(name="tip_rack_01")
+  tip_car[0] = hamilton_96_tiprack_1000uL_filter(name="tip_rack_01")
 
   plt_car = PLT_CAR_L5AC_A00(name="plate_carrier")
   plt_car[0] = plate = Cor_96_wellplate_360ul_Fb(name="aspiration plate")
-  plate.get_item("A1").tracker.set_liquids([(None, 400)])
+  plate.get_item("A1").tracker.set_volume(400)
 
   deck = STARLetDeck()
   deck.assign_child_resource(tip_car, rails=1)
@@ -51,7 +58,7 @@ def _wait_for_task_done(base_url, client, task_id):
 
 class LiquidHandlingApiGeneralTests(unittest.IsolatedAsyncioTestCase):
   def setUp(self):
-    self.backend = SerializingSavingBackend(num_channels=8)
+    self.backend = _create_mock_backend(num_channels=8)
     self.deck = STARLetDeck()
     self.lh = LiquidHandler(backend=self.backend, deck=self.deck)
     self.app = create_app(lh=self.lh)
@@ -126,7 +133,7 @@ class LiquidHandlingApiGeneralTests(unittest.IsolatedAsyncioTestCase):
 
 class LiquidHandlingApiOpsTests(unittest.TestCase):
   def setUp(self) -> None:
-    self.backend = SerializingSavingBackend(num_channels=8)
+    self.backend = _create_mock_backend(num_channels=8)
     self.deck = STARLetDeck()
     self.lh = LiquidHandler(backend=self.backend, deck=self.deck)
     self.app = create_app(lh=self.lh)
@@ -203,7 +210,7 @@ class LiquidHandlingApiOpsTests(unittest.TestCase):
           "channels": [
             {
               "resource_name": well.name,
-              "volume": 10,
+              "volume": 10.0,
               "tip": serialize(tip),
               "offset": {
                 "type": "Coordinate",
@@ -211,7 +218,6 @@ class LiquidHandlingApiOpsTests(unittest.TestCase):
                 "y": 0,
                 "z": 0,
               },
-              "liquids": [[None, 10]],
               "flow_rate": None,
               "liquid_height": None,
               "blow_out_air_volume": 0,
@@ -220,6 +226,7 @@ class LiquidHandlingApiOpsTests(unittest.TestCase):
           "use_channels": [0],
         },
       )
+      print(task)
       response = _wait_for_task_done(self.base_url, client, task.json.get("id"))
       self.assertEqual(response.json.get("status"), "succeeded")
       self.assertEqual(response.status_code, 200)
@@ -244,7 +251,6 @@ class LiquidHandlingApiOpsTests(unittest.TestCase):
                 "y": 0,
                 "z": 0,
               },
-              "liquids": [[None, 10]],
               "flow_rate": None,
               "liquid_height": None,
               "blow_out_air_volume": 0,

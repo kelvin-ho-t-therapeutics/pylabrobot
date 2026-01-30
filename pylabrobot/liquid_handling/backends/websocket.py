@@ -7,22 +7,21 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 try:
   import websockets
+  import websockets.asyncio.server
   import websockets.exceptions
-  import websockets.legacy
-  import websockets.legacy.server
 
   HAS_WEBSOCKETS = True
-except ImportError:
+except ImportError as e:
   HAS_WEBSOCKETS = False
+  _WEBSOCKETS_IMPORT_ERROR = e
 
 from pylabrobot.__version__ import STANDARD_FORM_JSON_VERSION
 from pylabrobot.liquid_handling.backends.serializing_backend import (
   SerializingBackend,
 )
-from pylabrobot.resources import Resource
 
 if TYPE_CHECKING:
-  import websockets.legacy
+  import websockets.asyncio.server
 
 
 logger = logging.getLogger("pylabrobot")
@@ -46,10 +45,12 @@ class WebSocketBackend(SerializingBackend):
     """
 
     if not HAS_WEBSOCKETS:
-      raise RuntimeError("The WebSocketBackend requires websockets to be installed.")
+      raise RuntimeError(
+        f"The WebSocketBackend requires websockets to be installed. Import error: {_WEBSOCKETS_IMPORT_ERROR}"
+      )
 
     super().__init__(num_channels=num_channels)
-    self._websocket: Optional["websockets.legacy.server.WebSocketServerProtocol"] = None
+    self._websocket: Optional["websockets.asyncio.server.ServerConnection"] = None
     self._loop: Optional[asyncio.AbstractEventLoop] = None
     self._t: Optional[threading.Thread] = None
     self._stop_: Optional[asyncio.Future] = None
@@ -65,7 +66,7 @@ class WebSocketBackend(SerializingBackend):
   @property
   def websocket(
     self,
-  ) -> "websockets.legacy.server.WebSocketServerProtocol":
+  ) -> "websockets.asyncio.server.ServerConnection":
     """The websocket connection."""
     if self._websocket is None:
       raise RuntimeError("No websocket connection has been established.")
@@ -113,7 +114,7 @@ class WebSocketBackend(SerializingBackend):
 
   async def _socket_handler(
     self,
-    websocket: "websockets.legacy.server.WebSocketServerProtocol",
+    websocket: "websockets.asyncio.server.ServerConnection",
   ):
     """Handle a new websocket connection. Save the websocket connection store received
     messages in `self.received`."""
@@ -168,24 +169,6 @@ class WebSocketBackend(SerializingBackend):
 
     while not self.has_connection():
       time.sleep(0.1)
-
-  async def assigned_resource_callback(self, resource: Resource):
-    # override SerializingBackend so we don't wait for a response
-    await self.send_command(
-      command="resource_assigned",
-      data={
-        "resource": resource.serialize(),
-        "parent_name": (resource.parent.name if resource.parent else None),
-      },
-      wait_for_response=False,
-    )
-
-  async def unassigned_resource_callback(self, name: str):
-    # override SerializingBackend so we don't wait for a response
-    await self.send_command(
-      command="resource_unassigned",
-      data={"resource_name": name, "wait_for_response": False},
-    )
 
   async def send_command(
     self,
@@ -252,13 +235,15 @@ class WebSocketBackend(SerializingBackend):
     """Start the websocket server. This will run in a separate thread."""
 
     if not HAS_WEBSOCKETS:
-      raise RuntimeError("The WebSocketBackend requires websockets to be installed.")
+      raise RuntimeError(
+        f"The WebSocketBackend requires websockets to be installed. Import error: {_WEBSOCKETS_IMPORT_ERROR}"
+      )
 
     async def run_server():
       self._stop_ = self.loop.create_future()
       while True:
         try:
-          async with websockets.legacy.server.serve(
+          async with websockets.asyncio.server.serve(
             self._socket_handler, self.ws_host, self.ws_port
           ):
             print(f"Websocket server started at http://{self.ws_host}:{self.ws_port}")

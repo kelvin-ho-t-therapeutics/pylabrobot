@@ -1,4 +1,3 @@
-import sys
 from abc import ABCMeta, abstractmethod
 from typing import Any, Dict, List, Optional, Union
 
@@ -20,13 +19,8 @@ from pylabrobot.liquid_handling.standard import (
   SingleChannelAspiration,
   SingleChannelDispense,
 )
-from pylabrobot.resources import Resource, Tip
+from pylabrobot.resources import Tip
 from pylabrobot.serializer import serialize
-
-if sys.version_info >= (3, 8):
-  from typing import TypedDict
-else:
-  from typing_extensions import TypedDict
 
 
 class SerializingBackend(LiquidHandlerBackend, metaclass=ABCMeta):
@@ -56,18 +50,6 @@ class SerializingBackend(LiquidHandlerBackend, metaclass=ABCMeta):
 
   def serialize(self) -> dict:
     return {**super().serialize(), "num_channels": self.num_channels}
-
-  async def assigned_resource_callback(self, resource: Resource):
-    await self.send_command(
-      command="resource_assigned",
-      data={
-        "resource": resource.serialize(),
-        "parent_name": (resource.parent.name if resource.parent else None),
-      },
-    )
-
-  async def unassigned_resource_callback(self, name: str):
-    await self.send_command(command="resource_unassigned", data={"resource_name": name})
 
   async def pick_up_tips(self, ops: List[Pickup], use_channels: List[int]):
     serialized = [
@@ -107,7 +89,7 @@ class SerializingBackend(LiquidHandlerBackend, metaclass=ABCMeta):
         "flow_rate": serialize(op.flow_rate),
         "liquid_height": serialize(op.liquid_height),
         "blow_out_air_volume": serialize(op.blow_out_air_volume),
-        "liquids": serialize(op.liquids),
+        "mix": serialize(op.mix),
       }
       for op in ops
     ]
@@ -126,7 +108,7 @@ class SerializingBackend(LiquidHandlerBackend, metaclass=ABCMeta):
         "flow_rate": serialize(op.flow_rate),
         "liquid_height": serialize(op.liquid_height),
         "blow_out_air_volume": serialize(op.blow_out_air_volume),
-        "liquids": serialize(op.liquids),
+        "mix": serialize(op.mix),
       }
       for op in ops
     ]
@@ -163,7 +145,6 @@ class SerializingBackend(LiquidHandlerBackend, metaclass=ABCMeta):
         "flow_rate": serialize(aspiration.flow_rate),
         "liquid_height": serialize(aspiration.liquid_height),
         "blow_out_air_volume": serialize(aspiration.blow_out_air_volume),
-        "liquids": serialize(aspiration.liquids),
         "tips": [serialize(tip) for tip in aspiration.tips],
       }
     }
@@ -181,7 +162,6 @@ class SerializingBackend(LiquidHandlerBackend, metaclass=ABCMeta):
         "flow_rate": serialize(dispense.flow_rate),
         "liquid_height": serialize(dispense.liquid_height),
         "blow_out_air_volume": serialize(dispense.blow_out_air_volume),
-        "liquids": serialize(dispense.liquids),
         "tips": [serialize(tip) for tip in dispense.tips],
       }
     }
@@ -223,7 +203,7 @@ class SerializingBackend(LiquidHandlerBackend, metaclass=ABCMeta):
         "offset": serialize(drop.offset),
         "pickup_distance_from_top": drop.pickup_distance_from_top,
         "pickup_direction": serialize(drop.pickup_direction),
-        "drop_direction": serialize(drop.drop_direction),
+        "drop_direction": serialize(drop.direction),
         "rotation": drop.rotation,
       },
       **backend_kwargs,
@@ -246,27 +226,3 @@ class SerializingBackend(LiquidHandlerBackend, metaclass=ABCMeta):
 
   def can_pick_up_tip(self, channel_idx: int, tip: Tip) -> bool:
     return True
-
-
-class SerializingSavingBackend(SerializingBackend):
-  """A backend that saves all serialized commands in `self.sent_commands`, wrote for testing."""
-
-  class Command(TypedDict):
-    command: str
-    data: Optional[Dict[str, Any]]
-
-  async def setup(self):
-    self.sent_commands: List[SerializingSavingBackend.Command] = []
-    await super().setup()
-
-  async def send_command(self, command: str, data: Optional[Dict[str, Any]] = None):
-    self.sent_commands.append({"command": command, "data": data})
-
-  def clear(self):
-    self.sent_commands = []
-
-  def get_first_data_for_command(self, command: str) -> Optional[Dict[str, Any]]:
-    for sent_command in self.sent_commands:
-      if sent_command["command"] == command:
-        return sent_command["data"]
-    return None

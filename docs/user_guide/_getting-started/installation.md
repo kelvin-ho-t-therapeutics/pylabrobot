@@ -6,14 +6,14 @@ Note that there are additional installation steps for using the firmware (univer
 
 ## Installing PyLabRobot
 
-It is highly recommended that you install PyLabRobot in a virtual environment. [virtualenv](https://virtualenv.pypa.io/en/latest/) is a popular tool for doing that, but you can use any tool you like. Note that virtualenv needs to be installed separately first.
+It is highly recommended that you install PyLabRobot in a virtual environment.
 
-Here's how to create a virtual environment using virtualenv:
+Here's how to create a virtual environment using `venv`:
 
 ```bash
 mkdir your_project
 cd your_project
-python -m virtualenv env
+python -m venv env
 source env/bin/activate  # on Windows: .\env\Scripts\activate
 ```
 
@@ -97,6 +97,10 @@ You need to install [libusb](https://libusb.info/). You can do this using [Homeb
 brew install libusb
 ```
 
+```{warning}
+People have reported issues with not being able to find the machine on macOS 15 Sonoma. No solution to this is currently known. See [this thread](https://labautomation.io/t/usb-device-not-found-error-potential-macos-15-issue/4568).
+```
+
 ### On Windows
 
 #### Installing
@@ -165,9 +169,9 @@ If you get a `usb.core.NoBackendError: No backend available` error: [this](https
 
 If you are still having trouble, please reach out on [discuss.pylabrobot.org](https://discuss.pylabrobot.org).
 
-## Cytation5 imager {#cytation5-imager}
+## Cytation imager
 
-In order to use imaging on the Cytation5, you need to:
+In order to use imaging on the Cytation, you need to:
 
 1. Install python 3.10
 2. Download Spinnaker SDK and install (including Python) [https://www.teledynevisionsolutions.com/products/spinnaker-sdk/](https://www.teledynevisionsolutions.com/products/spinnaker-sdk/)

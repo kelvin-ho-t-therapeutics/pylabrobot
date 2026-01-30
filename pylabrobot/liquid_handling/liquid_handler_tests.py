@@ -2,10 +2,13 @@ import itertools
 import tempfile
 import unittest
 import unittest.mock
-from typing import Any, Dict, List, Optional, Union, cast
+from typing import Any, List, Union, cast
+from unittest.mock import PropertyMock
 
 import pytest
 
+from pylabrobot.liquid_handling.backends.backend import LiquidHandlerBackend
+from pylabrobot.liquid_handling.backends.chatterbox import LiquidHandlerChatterboxBackend
 from pylabrobot.liquid_handling.errors import ChannelizedError
 from pylabrobot.liquid_handling.strictness import (
   Strictness,
@@ -20,30 +23,31 @@ from pylabrobot.resources import (
   Cor_96_wellplate_360ul_Fb,
   Deck,
   Lid,
-  Liquid,
   Plate,
   ResourceNotFoundError,
   ResourceStack,
   TipRack,
+  nest_1_troughplate_195000uL_Vb,
   no_tip_tracking,
   set_tip_tracking,
 )
 from pylabrobot.resources.carrier import PlateHolder
 from pylabrobot.resources.errors import (
-  CrossContaminationError,
   HasTipError,
   NoTipError,
 )
-from pylabrobot.resources.hamilton import HTF, STF, STARLetDeck
-from pylabrobot.resources.opentrons.reservoirs import agilent_1_reservoir_290ml
+from pylabrobot.resources.hamilton import (
+  STARLetDeck,
+  hamilton_96_tiprack_300uL_filter,
+  hamilton_96_tiprack_1000uL_filter,
+)
 from pylabrobot.resources.utils import create_ordered_items_2d
 from pylabrobot.resources.volume_tracker import (
-  set_cross_contamination_tracking,
   set_volume_tracking,
 )
 from pylabrobot.resources.well import Well
+from pylabrobot.serializer import serialize
 
-from . import backends
 from .liquid_handler import LiquidHandler
 from .standard import (
   Drop,
@@ -55,6 +59,14 @@ from .standard import (
   SingleChannelAspiration,
   SingleChannelDispense,
 )
+
+
+def _create_mock_backend(num_channels: int = 8):
+  """Create a mock LiquidHandlerBackend with the specified number of channels."""
+  mock = unittest.mock.create_autospec(LiquidHandlerBackend, instance=True)
+  type(mock).num_channels = PropertyMock(return_value=num_channels)
+  mock.can_pick_up_tip.return_value = True
+  return mock
 
 
 def _make_asp(
@@ -71,7 +83,7 @@ def _make_asp(
     flow_rate=None,
     liquid_height=None,
     blow_out_air_volume=None,
-    liquids=[(None, vol)],
+    mix=None,
   )
 
 
@@ -89,21 +101,21 @@ def _make_disp(
     flow_rate=None,
     liquid_height=None,
     blow_out_air_volume=None,
-    liquids=[(None, vol)],
+    mix=None,
   )
 
 
 class TestLiquidHandlerLayout(unittest.IsolatedAsyncioTestCase):
   def setUp(self):
-    self.backend = backends.SaverBackend(num_channels=8)
+    self.backend = _create_mock_backend(num_channels=8)
     self.deck = STARLetDeck()
     self.lh = LiquidHandler(self.backend, deck=self.deck)
 
   def test_resource_assignment(self):
     tip_car = TIP_CAR_480_A00(name="tip_carrier")
-    tip_car[0] = STF(name="tip_rack_01")
-    tip_car[1] = STF(name="tip_rack_02")
-    tip_car[3] = HTF("tip_rack_04")
+    tip_car[0] = hamilton_96_tiprack_300uL_filter(name="tip_rack_01")
+    tip_car[1] = hamilton_96_tiprack_300uL_filter(name="tip_rack_02")
+    tip_car[3] = hamilton_96_tiprack_1000uL_filter("tip_rack_04")
 
     plt_car = PLT_CAR_L5AC_A00(name="plate carrier")
     plt_car[0] = Cor_96_wellplate_360ul_Fb(name="aspiration plate")
@@ -135,7 +147,7 @@ class TestLiquidHandlerLayout(unittest.IsolatedAsyncioTestCase):
 
   def test_get_resource(self):
     tip_car = TIP_CAR_480_A00(name="tip_carrier")
-    tip_car[0] = STF(name="tip_rack_01")
+    tip_car[0] = hamilton_96_tiprack_300uL_filter(name="tip_rack_01")
     plt_car = PLT_CAR_L5AC_A00(name="plate carrier")
     plt_car[0] = Cor_96_wellplate_360ul_Fb(name="aspiration plate")
     self.deck.assign_child_resource(tip_car, rails=1)
@@ -158,8 +170,8 @@ class TestLiquidHandlerLayout(unittest.IsolatedAsyncioTestCase):
 
   def test_subcoordinates(self):
     tip_car = TIP_CAR_480_A00(name="tip_carrier")
-    tip_car[0] = STF(name="tip_rack_01")
-    tip_car[3] = HTF(name="tip_rack_04")
+    tip_car[0] = hamilton_96_tiprack_300uL_filter(name="tip_rack_01")
+    tip_car[3] = hamilton_96_tiprack_1000uL_filter(name="tip_rack_04")
     plt_car = PLT_CAR_L5AC_A00(name="plate carrier")
     plt_car[0] = Cor_96_wellplate_360ul_Fb(name="aspiration plate")
     plt_car[2] = Cor_96_wellplate_360ul_Fb(name="dispense plate")
@@ -207,7 +219,7 @@ class TestLiquidHandlerLayout(unittest.IsolatedAsyncioTestCase):
     # Test assigning subresource with the same name as another resource in another carrier. This
     # should raise an ValueError when the carrier is assigned to the liquid handler.
     tip_car = TIP_CAR_480_A00(name="tip_carrier")
-    tip_car[0] = STF(name="sub")
+    tip_car[0] = hamilton_96_tiprack_300uL_filter(name="sub")
     plt_car = PLT_CAR_L5AC_A00(name="plate carrier")
     plt_car[0] = Cor_96_wellplate_360ul_Fb(name="sub")
     self.deck.assign_child_resource(tip_car, rails=1)
@@ -218,7 +230,7 @@ class TestLiquidHandlerLayout(unittest.IsolatedAsyncioTestCase):
     # Test assigning subresource with the same name as another resource in another carrier, after
     # the carrier has been assigned. This should raise an error.
     tip_car = TIP_CAR_480_A00(name="tip_carrier")
-    tip_car[0] = STF(name="sub")
+    tip_car[0] = hamilton_96_tiprack_300uL_filter(name="sub")
     plt_car = PLT_CAR_L5AC_A00(name="plate carrier")
     plt_car[0] = Cor_96_wellplate_360ul_Fb(name="ok")
     self.deck.assign_child_resource(tip_car, rails=1)
@@ -252,7 +264,7 @@ class TestLiquidHandlerLayout(unittest.IsolatedAsyncioTestCase):
 
   async def test_move_lid(self):
     plate = Plate("plate", size_x=100, size_y=100, size_z=15, ordered_items={})
-    plate.location = Coordinate(0, 0, 100)
+    self.deck.assign_child_resource(plate, location=Coordinate(0, 0, 100))
     lid_height = 10
     lid = Lid(
       name="lid",
@@ -261,7 +273,7 @@ class TestLiquidHandlerLayout(unittest.IsolatedAsyncioTestCase):
       size_z=lid_height,
       nesting_z_height=lid_height,
     )
-    lid.location = Coordinate(100, 100, 200)
+    self.deck.assign_child_resource(lid, location=Coordinate(100, 100, 200))
 
     assert plate.get_absolute_location().x != lid.get_absolute_location().x
     assert plate.get_absolute_location().y != lid.get_absolute_location().y
@@ -432,13 +444,17 @@ class TestLiquidHandlerLayout(unittest.IsolatedAsyncioTestCase):
         lid.rotation.z = 0
 
   def test_serialize(self):
-    serialized = self.lh.serialize()
+    # Use a real backend for serialization test since mocks can't be deserialized
+    backend = LiquidHandlerChatterboxBackend(num_channels=8)
+    lh = LiquidHandler(backend, deck=STARLetDeck())
+
+    serialized = lh.serialize()
     deserialized = LiquidHandler.deserialize(serialized)
 
-    self.assertEqual(deserialized.deck, self.lh.deck)
+    self.assertEqual(deserialized.deck, lh.deck)
     self.assertEqual(
       deserialized.backend.__class__.__name__,
-      self.lh.backend.__class__.__name__,
+      lh.backend.__class__.__name__,
     )
 
 
@@ -446,21 +462,15 @@ class TestLiquidHandlerCommands(unittest.IsolatedAsyncioTestCase):
   async def asyncSetUp(self):
     self.maxDiff = None
 
-    self.backend = backends.SaverBackend(num_channels=8)
+    self.backend = _create_mock_backend(num_channels=8)
     self.deck = STARLetDeck()
     self.lh = LiquidHandler(backend=self.backend, deck=self.deck)
 
-    self.tip_rack = STF(name="tip_rack")
+    self.tip_rack = hamilton_96_tiprack_300uL_filter(name="tip_rack")
     self.plate = Cor_96_wellplate_360ul_Fb(name="plate")
     self.deck.assign_child_resource(self.tip_rack, location=Coordinate(0, 0, 0))
     self.deck.assign_child_resource(self.plate, location=Coordinate(100, 100, 0))
     await self.lh.setup()
-
-  def get_first_command(self, command) -> Optional[Dict[str, Any]]:
-    for sent_command in self.backend.commands_received:
-      if sent_command["command"] == command:
-        return sent_command
-    return None
 
   async def test_offsets_tips(self):
     tip_spot = self.tip_rack.get_item("A1")
@@ -468,28 +478,62 @@ class TestLiquidHandlerCommands(unittest.IsolatedAsyncioTestCase):
     await self.lh.pick_up_tips([tip_spot], offsets=[Coordinate(x=1, y=1, z=1)])
     await self.lh.drop_tips([tip_spot], offsets=[Coordinate(x=1, y=1, z=1)])
 
-    self.assertEqual(
-      self.get_first_command("pick_up_tips"),
-      {
-        "command": "pick_up_tips",
-        "args": (),
-        "kwargs": {
-          "use_channels": [0],
-          "ops": [Pickup(tip_spot, tip=tip, offset=Coordinate(x=1, y=1, z=1))],
-        },
-      },
+    self.backend.pick_up_tips.assert_called_once_with(
+      use_channels=[0],
+      ops=[Pickup(tip_spot, tip=tip, offset=Coordinate(x=1, y=1, z=1))],
     )
-    self.assertEqual(
-      self.get_first_command("drop_tips"),
-      {
-        "command": "drop_tips",
-        "args": (),
-        "kwargs": {
-          "use_channels": [0],
-          "ops": [Drop(tip_spot, tip=tip, offset=Coordinate(x=1, y=1, z=1))],
-        },
-      },
+    self.backend.drop_tips.assert_called_once_with(
+      use_channels=[0],
+      ops=[Drop(tip_spot, tip=tip, offset=Coordinate(x=1, y=1, z=1))],
     )
+
+  async def test_default_offset_head96(self):
+    self.lh.default_offset_head96 = Coordinate(1, 2, 3)
+
+    await self.lh.pick_up_tips96(self.tip_rack)
+    self.backend.pick_up_tips96.assert_called_once()
+    call_kwargs = self.backend.pick_up_tips96.call_args.kwargs
+    self.assertEqual(call_kwargs["pickup"].offset, Coordinate(1, 2, 3))
+    self.backend.pick_up_tips96.reset_mock()
+
+    # aspirate with extra offset; effective offset should be default + provided
+    await self.lh.aspirate96(self.plate, volume=10, offset=Coordinate(1, 0, 0))
+    self.backend.aspirate96.assert_called_once()
+    call_kwargs = self.backend.aspirate96.call_args.kwargs
+    self.assertEqual(call_kwargs["aspiration"].offset, Coordinate(2, 2, 3))
+    self.backend.aspirate96.reset_mock()
+
+    # dispense without providing offset uses default
+    await self.lh.dispense96(self.plate, volume=10)
+    self.backend.dispense96.assert_called_once()
+    call_kwargs = self.backend.dispense96.call_args.kwargs
+    self.assertEqual(call_kwargs["dispense"].offset, Coordinate(1, 2, 3))
+    self.backend.dispense96.reset_mock()
+
+    await self.lh.drop_tips96(self.tip_rack, offset=Coordinate(0, 1, 0))
+    self.backend.drop_tips96.assert_called_once()
+    call_kwargs = self.backend.drop_tips96.call_args.kwargs
+    self.assertEqual(call_kwargs["drop"].offset, Coordinate(1, 3, 3))
+
+  async def test_default_offset_head96_initializer(self):
+    backend = _create_mock_backend(num_channels=8)
+    deck = STARLetDeck()
+    lh = LiquidHandler(
+      backend=backend,
+      deck=deck,
+      default_offset_head96=Coordinate(1, 2, 3),
+    )
+    self.assertEqual(lh.default_offset_head96, Coordinate(1, 2, 3))
+
+  async def test_default_offset_head96_serialization(self):
+    # Use a real backend for serialization test since mocks can't be deserialized
+    backend = LiquidHandlerChatterboxBackend(num_channels=8)
+    lh = LiquidHandler(backend=backend, deck=STARLetDeck())
+    lh.default_offset_head96 = Coordinate(1, 2, 3)
+    data = lh.serialize()
+    self.assertEqual(data["default_offset_head96"], serialize(Coordinate(1, 2, 3)))
+    new_lh = LiquidHandler.deserialize(data)
+    self.assertEqual(new_lh.default_offset_head96, Coordinate(1, 2, 3))
 
   async def test_with_use_channels(self):
     tip_spot = self.tip_rack.get_item("A1")
@@ -498,58 +542,30 @@ class TestLiquidHandlerCommands(unittest.IsolatedAsyncioTestCase):
       await self.lh.pick_up_tips([tip_spot])
       await self.lh.drop_tips([tip_spot])
 
-    self.assertEqual(
-      self.get_first_command("pick_up_tips"),
-      {
-        "command": "pick_up_tips",
-        "args": (),
-        "kwargs": {
-          "use_channels": [2],
-          "ops": [Pickup(tip_spot, tip=tip, offset=Coordinate.zero())],
-        },
-      },
+    self.backend.pick_up_tips.assert_called_once_with(
+      use_channels=[2],
+      ops=[Pickup(tip_spot, tip=tip, offset=Coordinate.zero())],
     )
-    self.assertEqual(
-      self.get_first_command("drop_tips"),
-      {
-        "command": "drop_tips",
-        "args": (),
-        "kwargs": {
-          "use_channels": [2],
-          "ops": [Drop(tip_spot, tip=tip, offset=Coordinate.zero())],
-        },
-      },
+    self.backend.drop_tips.assert_called_once_with(
+      use_channels=[2],
+      ops=[Drop(tip_spot, tip=tip, offset=Coordinate.zero())],
     )
 
   async def test_offsets_asp_disp(self):
     well = self.plate.get_item("A1")
-    well.tracker.set_liquids([(None, 10)])
+    self.plate.get_item("A1").tracker.set_volume(10)
     t = self.tip_rack.get_item("A1").get_tip()
     self.lh.update_head_state({0: t})
     await self.lh.aspirate([well], vols=[10], offsets=[Coordinate(x=1, y=1, z=1)])
     await self.lh.dispense([well], vols=[10], offsets=[Coordinate(x=1, y=1, z=1)])
 
-    self.assertEqual(
-      self.get_first_command("aspirate"),
-      {
-        "command": "aspirate",
-        "args": (),
-        "kwargs": {
-          "use_channels": [0],
-          "ops": [_make_asp(well, vol=10, offset=Coordinate(x=1, y=1, z=1), tip=t)],
-        },
-      },
+    self.backend.aspirate.assert_called_once_with(
+      use_channels=[0],
+      ops=[_make_asp(well, vol=10, offset=Coordinate(x=1, y=1, z=1), tip=t)],
     )
-    self.assertEqual(
-      self.get_first_command("dispense"),
-      {
-        "command": "dispense",
-        "args": (),
-        "kwargs": {
-          "use_channels": [0],
-          "ops": [_make_disp(well, vol=10, offset=Coordinate(x=1, y=1, z=1), tip=t)],
-        },
-      },
+    self.backend.dispense.assert_called_once_with(
+      use_channels=[0],
+      ops=[_make_disp(well, vol=10, offset=Coordinate(x=1, y=1, z=1), tip=t)],
     )
 
   async def test_return_tips(self):
@@ -558,16 +574,9 @@ class TestLiquidHandlerCommands(unittest.IsolatedAsyncioTestCase):
     await self.lh.pick_up_tips([tip_spot])
     await self.lh.return_tips()
 
-    self.assertEqual(
-      self.get_first_command("drop_tips"),
-      {
-        "command": "drop_tips",
-        "args": (),
-        "kwargs": {
-          "use_channels": [0],
-          "ops": [Drop(tip_spot, tip=tip, offset=Coordinate.zero())],
-        },
-      },
+    self.backend.drop_tips.assert_called_once_with(
+      use_channels=[0],
+      ops=[Drop(tip_spot, tip=tip, offset=Coordinate.zero())],
     )
 
     with self.assertRaises(RuntimeError):
@@ -583,175 +592,103 @@ class TestLiquidHandlerCommands(unittest.IsolatedAsyncioTestCase):
     for i in range(96):
       assert not self.lh.head96[i].has_tip, f"Channel head {i} is not empty."
 
-    self.assertEqual(
-      self.get_first_command("drop_tips96"),
-      {
-        "command": "drop_tips96",
-        "args": (),
-        "kwargs": {"drop": DropTipRack(resource=self.tip_rack, offset=Coordinate.zero())},
-      },
+    self.backend.drop_tips96.assert_called_once_with(
+      drop=DropTipRack(resource=self.tip_rack, offset=Coordinate.zero())
     )
 
     with self.assertRaises(RuntimeError):
       await self.lh.return_tips()
 
   async def test_aspirate_dispense96(self):
-    self.plate.get_item("A1").tracker.set_liquids([(None, 10)])
     await self.lh.pick_up_tips96(self.tip_rack)
     await self.lh.aspirate96(self.plate, volume=10)
-    for i in range(96):
-      self.assertTrue(self.lh.head96[i].has_tip)
-      self.assertEqual(self.lh.head96[i].get_tip().tracker.get_used_volume(), 10)
-    await self.lh.dispense96(self.plate, volume=10)
-    for i in range(96):
-      self.assertEqual(self.lh.head96[i].get_tip().tracker.get_used_volume(), 0)
+    await self.lh.dispense96(self.plate, 10)
+    self.backend.dispense96.assert_called_with(
+      dispense=MultiHeadDispensePlate(
+        wells=self.plate.get_all_items(),
+        offset=Coordinate.zero(),
+        tips=[self.lh.head96[i].get_tip() for i in range(96)],
+        volume=10,
+        flow_rate=None,
+        liquid_height=None,
+        blow_out_air_volume=None,
+        mix=None,
+      )
+    )
 
   async def test_transfer(self):
     t = self.tip_rack.get_item("A1").get_tip()
     self.lh.update_head_state({0: t})
 
     # Simple transfer
-    self.plate.get_item("A1").tracker.set_liquids([(None, 10)])
+    self.plate.get_item("A1").tracker.set_volume(10)
     await self.lh.transfer(self.plate.get_well("A1"), self.plate["A2"], source_vol=10)
 
-    self.assertEqual(
-      self.get_first_command("aspirate"),
-      {
-        "command": "aspirate",
-        "args": (),
-        "kwargs": {
-          "use_channels": [0],
-          "ops": [_make_asp(self.plate.get_item("A1"), vol=10.0, tip=t)],
-        },
-      },
+    self.backend.aspirate.assert_called_once_with(
+      use_channels=[0],
+      ops=[_make_asp(self.plate.get_item("A1"), vol=10.0, tip=t)],
     )
-    self.assertEqual(
-      self.get_first_command("dispense"),
-      {
-        "command": "dispense",
-        "args": (),
-        "kwargs": {
-          "use_channels": [0],
-          "ops": [_make_disp(self.plate.get_item("A2"), vol=10.0, tip=t)],
-        },
-      },
+    self.backend.dispense.assert_called_once_with(
+      use_channels=[0],
+      ops=[_make_disp(self.plate.get_item("A2"), vol=10.0, tip=t)],
     )
-    self.backend.clear()
+    self.backend.aspirate.reset_mock()
+    self.backend.dispense.reset_mock()
 
     # Transfer to multiple wells
-    self.plate.get_item("A1").tracker.set_liquids([(None, 80)])
+    self.plate.get_item("A1").tracker.set_volume(80)
     await self.lh.transfer(self.plate.get_well("A1"), self.plate["A1:H1"], source_vol=80)
-    self.assertEqual(
-      self.get_first_command("aspirate"),
-      {
-        "command": "aspirate",
-        "args": (),
-        "kwargs": {
-          "use_channels": [0],
-          "ops": [_make_asp(self.plate.get_item("A1"), vol=80.0, tip=t)],
-        },
-      },
+    self.backend.aspirate.assert_called_once_with(
+      use_channels=[0],
+      ops=[_make_asp(self.plate.get_item("A1"), vol=80.0, tip=t)],
     )
 
-    dispenses = list(
-      filter(
-        lambda x: x["command"] == "dispense",
-        self.backend.commands_received,
-      )
-    )
-    self.assertEqual(
-      dispenses,
-      [
-        {
-          "command": "dispense",
-          "args": (),
-          "kwargs": {
-            "use_channels": [0],
-            "ops": [_make_disp(well, vol=10.0, tip=t)],
-          },
-        }
-        for well in self.plate["A1:H1"]
-      ],
-    )
-    self.backend.clear()
+    dispense_calls = self.backend.dispense.call_args_list
+    expected_dispenses = [
+      unittest.mock.call(use_channels=[0], ops=[_make_disp(well, vol=10.0, tip=t)])
+      for well in self.plate["A1:H1"]
+    ]
+    self.assertEqual(dispense_calls, expected_dispenses)
+    self.backend.aspirate.reset_mock()
+    self.backend.dispense.reset_mock()
 
     # Transfer with ratios
-    self.plate.get_item("A1").tracker.set_liquids([(None, 60)])
+    self.plate.get_item("A1").tracker.set_volume(60)
     await self.lh.transfer(
       self.plate.get_well("A1"),
       self.plate["B1:C1"],
       source_vol=60,
       ratios=[2, 1],
     )
-    self.assertEqual(
-      self.get_first_command("aspirate"),
-      {
-        "command": "aspirate",
-        "args": (),
-        "kwargs": {
-          "use_channels": [0],
-          "ops": [_make_asp(self.plate.get_item("A1"), vol=60.0, tip=t)],
-        },
-      },
+    self.backend.aspirate.assert_called_once_with(
+      use_channels=[0],
+      ops=[_make_asp(self.plate.get_item("A1"), vol=60.0, tip=t)],
     )
-    dispenses = list(
-      filter(
-        lambda x: x["command"] == "dispense",
-        self.backend.commands_received,
-      )
-    )
-    self.assertEqual(
-      dispenses,
-      [
-        {
-          "command": "dispense",
-          "args": (),
-          "kwargs": {
-            "use_channels": [0],
-            "ops": [_make_disp(well, vol=vol, tip=t)],
-          },
-        }
-        for well, vol in zip(self.plate["B1:C1"], [40, 20])
-      ],
-    )
-    self.backend.clear()
+    dispense_calls = self.backend.dispense.call_args_list
+    expected_dispenses = [
+      unittest.mock.call(use_channels=[0], ops=[_make_disp(well, vol=vol, tip=t)])
+      for well, vol in zip(self.plate["B1:C1"], [40, 20])
+    ]
+    self.assertEqual(dispense_calls, expected_dispenses)
+    self.backend.aspirate.reset_mock()
+    self.backend.dispense.reset_mock()
 
     # Transfer with target_vols
     vols: List[float] = [3, 1, 4, 1, 5, 9, 6, 2]
-    self.plate.get_item("A1").tracker.set_liquids([(None, sum(vols))])
+    self.plate.get_item("A1").tracker.set_volume(sum(vols))
     await self.lh.transfer(self.plate.get_well("A1"), self.plate["A1:H1"], target_vols=vols)
-    self.assertEqual(
-      self.get_first_command("aspirate"),
-      {
-        "command": "aspirate",
-        "args": (),
-        "kwargs": {
-          "use_channels": [0],
-          "ops": [_make_asp(self.plate.get_well("A1"), vol=sum(vols), tip=t)],
-        },
-      },
+    self.backend.aspirate.assert_called_once_with(
+      use_channels=[0],
+      ops=[_make_asp(self.plate.get_well("A1"), vol=sum(vols), tip=t)],
     )
-    dispenses = list(
-      filter(
-        lambda x: x["command"] == "dispense",
-        self.backend.commands_received,
-      )
-    )
-    self.assertEqual(
-      dispenses,
-      [
-        {
-          "command": "dispense",
-          "args": (),
-          "kwargs": {
-            "use_channels": [0],
-            "ops": [_make_disp(well, vol=vol, tip=t)],
-          },
-        }
-        for well, vol in zip(self.plate["A1:H1"], vols)
-      ],
-    )
-    self.backend.clear()
+    dispense_calls = self.backend.dispense.call_args_list
+    expected_dispenses = [
+      unittest.mock.call(use_channels=[0], ops=[_make_disp(well, vol=vol, tip=t)])
+      for well, vol in zip(self.plate["A1:H1"], vols)
+    ]
+    self.assertEqual(dispense_calls, expected_dispenses)
+    self.backend.aspirate.reset_mock()
+    self.backend.dispense.reset_mock()
 
     # target_vols and source_vol specified
     with self.assertRaises(TypeError):
@@ -777,45 +714,30 @@ class TestLiquidHandlerCommands(unittest.IsolatedAsyncioTestCase):
     await self.lh.stamp(self.plate, self.plate, volume=10)
     ts = self.tip_rack.get_all_tips()
 
-    self.assertEqual(
-      self.get_first_command("aspirate96"),
-      {
-        "command": "aspirate96",
-        "args": (),
-        "kwargs": {
-          "aspiration": MultiHeadAspirationPlate(
-            wells=self.plate.get_all_items(),
-            volume=10.0,
-            tips=ts,
-            offset=Coordinate.zero(),
-            flow_rate=None,
-            liquid_height=None,
-            blow_out_air_volume=None,
-            liquids=[[(None, 10)]] * 96,
-          )
-        },
-      },
+    self.backend.aspirate96.assert_called_once_with(
+      aspiration=MultiHeadAspirationPlate(
+        wells=self.plate.get_all_items(),
+        volume=10.0,
+        tips=ts,
+        offset=Coordinate.zero(),
+        flow_rate=None,
+        liquid_height=None,
+        blow_out_air_volume=None,
+        mix=None,
+      )
     )
-    self.assertEqual(
-      self.get_first_command("dispense96"),
-      {
-        "command": "dispense96",
-        "args": (),
-        "kwargs": {
-          "dispense": MultiHeadDispensePlate(
-            wells=self.plate.get_all_items(),
-            volume=10.0,
-            tips=ts,
-            offset=Coordinate.zero(),
-            flow_rate=None,
-            liquid_height=None,
-            blow_out_air_volume=None,
-            liquids=[[(None, 10)]] * 96,
-          )
-        },
-      },
+    self.backend.dispense96.assert_called_once_with(
+      dispense=MultiHeadDispensePlate(
+        wells=self.plate.get_all_items(),
+        volume=10.0,
+        tips=ts,
+        offset=Coordinate.zero(),
+        flow_rate=None,
+        liquid_height=None,
+        blow_out_air_volume=None,
+        mix=None,
+      )
     )
-    self.backend.clear()
 
   async def test_tip_tracking_double_pickup(self):
     set_tip_tracking(enabled=True)
@@ -850,6 +772,19 @@ class TestLiquidHandlerCommands(unittest.IsolatedAsyncioTestCase):
       await self.lh.pick_up_tips(self.tip_rack["A1"])
     set_tip_tracking(enabled=False)
 
+  async def test_get_mounted_tips(self):
+    self.assertEqual(self.lh.get_mounted_tips(), [None] * 8)
+    await self.lh.pick_up_tips(self.tip_rack["A1", "B1", "C1"])
+    mounted = self.lh.get_mounted_tips()
+    self.assertIsNotNone(self.tip_rack.get_item("A1").get_tip())
+    self.assertIsNotNone(self.tip_rack.get_item("B1").get_tip())
+    self.assertIsNotNone(self.tip_rack.get_item("C1").get_tip())
+    self.assertIsNone(mounted[3])
+    self.assertIsNone(mounted[4])
+    self.assertIsNone(mounted[5])
+    self.assertIsNone(mounted[6])
+    self.assertIsNone(mounted[7])
+
   async def test_tip_tracking_full_spot(self):
     await self.lh.pick_up_tips(self.tip_rack["A1"])
     with self.assertRaises(HasTipError):
@@ -870,37 +805,36 @@ class TestLiquidHandlerCommands(unittest.IsolatedAsyncioTestCase):
     trash = self.deck.get_trash_area()
     offsets = get_tight_single_resource_liquid_op_offsets(trash, num_channels=4)
 
+    # drop_tips is called twice: once for pick_up, so check the second call
+    drop_tips_calls = self.backend.drop_tips.call_args_list
+    self.assertEqual(len(drop_tips_calls), 1)
     self.assertEqual(
-      self.get_first_command("drop_tips"),
-      {
-        "command": "drop_tips",
-        "args": (),
-        "kwargs": {
-          "use_channels": [0, 1, 3, 4],
-          "ops": [
-            Drop(
-              self.deck.get_trash_area(),
-              tip=tips[3],
-              offset=offsets[0],
-            ),
-            Drop(
-              self.deck.get_trash_area(),
-              tip=tips[2],
-              offset=offsets[1],
-            ),
-            Drop(
-              self.deck.get_trash_area(),
-              tip=tips[1],
-              offset=offsets[2],
-            ),
-            Drop(
-              self.deck.get_trash_area(),
-              tip=tips[0],
-              offset=offsets[3],
-            ),
-          ],
-        },
-      },
+      drop_tips_calls[0],
+      unittest.mock.call(
+        use_channels=[0, 1, 3, 4],
+        ops=[
+          Drop(
+            self.deck.get_trash_area(),
+            tip=tips[3],
+            offset=offsets[0],
+          ),
+          Drop(
+            self.deck.get_trash_area(),
+            tip=tips[2],
+            offset=offsets[1],
+          ),
+          Drop(
+            self.deck.get_trash_area(),
+            tip=tips[1],
+            offset=offsets[2],
+          ),
+          Drop(
+            self.deck.get_trash_area(),
+            tip=tips[0],
+            offset=offsets[3],
+          ),
+        ],
+      ),
     )
 
     # test tip tracking
@@ -917,21 +851,19 @@ class TestLiquidHandlerCommands(unittest.IsolatedAsyncioTestCase):
     )
     self.plate.assign_child_resource(lid)
     well = self.plate.get_item("A1")
-    well.tracker.set_liquids([(None, 10)])
     t = self.tip_rack.get_item("A1").get_tip()
     self.lh.update_head_state({0: t})
     with self.assertRaises(ValueError):
       await self.lh.aspirate([well], vols=[10])
 
-  @pytest.mark.filterwarnings("ignore:Extra arguments to backend.pick_up_tips")
+  @pytest.mark.filterwarnings("ignore:Extra arguments to backend")
   async def test_strictness(self):
-    class TestBackend(backends.SaverBackend):
-      """Override pick_up_tips for testing."""
+    # Create a mock backend with a custom pick_up_tips that checks arguments
+    async def custom_pick_up_tips(ops, use_channels, non_default, default=True):
+      assert non_default == default
 
-      async def pick_up_tips(self, ops, use_channels, non_default, default=True):  # type: ignore
-        assert non_default == default
-
-    self.backend = TestBackend(num_channels=16)
+    self.backend = _create_mock_backend(num_channels=16)
+    self.backend.pick_up_tips = custom_pick_up_tips
     self.lh = LiquidHandler(self.backend, deck=self.deck)
     await self.lh.setup()
 
@@ -989,7 +921,7 @@ class TestLiquidHandlerCommands(unittest.IsolatedAsyncioTestCase):
     set_volume_tracking(enabled=True)
 
     # set and save the state
-    self.plate.get_item("A2").tracker.set_liquids([(None, 10)])
+    self.plate.get_item("A2").tracker.set_volume(10)
     state_filename = tempfile.mktemp()
     self.lh.deck.save_state_to_file(fn=state_filename)
 
@@ -998,22 +930,18 @@ class TestLiquidHandlerCommands(unittest.IsolatedAsyncioTestCase):
     self.lh.deck.save(fn=deck_filename)
 
     # create a new liquid handler, load the state and the deck
-    lh2 = LiquidHandler(self.backend, deck=STARLetDeck())
+    backend2 = _create_mock_backend(num_channels=8)
+    lh2 = LiquidHandler(backend2, deck=STARLetDeck())
     lh2.deck = Deck.load_from_json_file(json_file=deck_filename)
     lh2.deck.load_state_from_file(fn=state_filename)
 
     # assert that the state is the same
     well_a1 = lh2.deck.get_resource("plate").get_item("A1")  # type: ignore
-    self.assertEqual(well_a1.tracker.liquids, [])
+    self.assertEqual(well_a1.tracker.volume, 0)
     well_a2 = lh2.deck.get_resource("plate").get_item("A2")  # type: ignore
-    self.assertEqual(well_a2.tracker.liquids, [(None, 10)])
+    self.assertEqual(well_a2.tracker.volume, 10)
 
     set_volume_tracking(enabled=False)
-
-  async def test_aspirate_single_reservoir(self):
-    reagent_reservoir = agilent_1_reservoir_290ml(name="reservoir")
-    await self.lh.pick_up_tips96(self.tip_rack)
-    await self.lh.aspirate96(reagent_reservoir.get_item("A1"), volume=100)
 
   async def test_pick_up_tips96_incomplete_rack(self):
     set_tip_tracking(enabled=True)
@@ -1034,13 +962,15 @@ class TestLiquidHandlerCommands(unittest.IsolatedAsyncioTestCase):
 
 class TestLiquidHandlerVolumeTracking(unittest.IsolatedAsyncioTestCase):
   async def asyncSetUp(self):
-    self.backend = backends.SaverBackend(num_channels=8)
+    self.backend = _create_mock_backend(num_channels=8)
     self.deck = STARLetDeck()
     self.lh = LiquidHandler(backend=self.backend, deck=self.deck)
-    self.tip_rack = STF(name="tip_rack")
-    self.plate = Cor_96_wellplate_360ul_Fb(name="plate")
+    self.tip_rack = hamilton_96_tiprack_300uL_filter(name="tip_rack")
     self.deck.assign_child_resource(self.tip_rack, location=Coordinate(0, 0, 0))
+    self.plate = Cor_96_wellplate_360ul_Fb(name="plate")
     self.deck.assign_child_resource(self.plate, location=Coordinate(100, 100, 0))
+    self.single_well_plate = nest_1_troughplate_195000uL_Vb(name="single_well_plate")
+    self.deck.assign_child_resource(self.single_well_plate, location=Coordinate(300, 100, 0))
     await self.lh.setup()
     set_volume_tracking(enabled=True)
 
@@ -1050,25 +980,22 @@ class TestLiquidHandlerVolumeTracking(unittest.IsolatedAsyncioTestCase):
   async def test_dispense_with_volume_tracking(self):
     well = self.plate.get_item("A1")
     await self.lh.pick_up_tips(self.tip_rack["A1"])
-    well.tracker.set_liquids([(None, 10)])
+    well.tracker.set_volume(10)
     await self.lh.aspirate([well], vols=[10])
     await self.lh.dispense([well], vols=[10])
-    self.assertEqual(well.tracker.liquids, [(None, 10)])
+    self.assertEqual(well.tracker.volume, 10)
 
   async def test_mix_volume_tracking(self):
     for i in range(8):
-      self.plate.get_item(i).set_liquids([(Liquid.SERUM, 55)])
+      self.plate.get_item(i).set_volume(55)
 
     await self.lh.pick_up_tips(self.tip_rack[0:8])
-    initial_liquids = [self.plate.get_item(i).tracker.liquids for i in range(8)]
     for _ in range(10):
       await self.lh.aspirate(self.plate[0:8], vols=[45] * 8)
       await self.lh.dispense(self.plate[0:8], vols=[45] * 8)
-    liquids_now = [self.plate.get_item(i).tracker.liquids for i in range(8)]
-    self.assertEqual(liquids_now, initial_liquids)
 
   async def test_channel_1_liquid_tracking(self):
-    self.plate.get_item("A1").tracker.set_liquids([(Liquid.WATER, 10)])
+    self.plate.get_item("A1").tracker.set_volume(10)
     with self.lh.use_channels([1]):
       await self.lh.pick_up_tips(self.tip_rack["A1"])
       await self.lh.aspirate([self.plate.get_item("A1")], vols=[10])
@@ -1082,18 +1009,18 @@ class TestLiquidHandlerVolumeTracking(unittest.IsolatedAsyncioTestCase):
       raise ChannelizedError(errors={0: Exception("This is an error")})
 
     self.backend.dispense = error_func  # type: ignore
-    well.tracker.set_liquids([(None, 200)])
+    well.tracker.set_volume(200)
 
     await self.lh.aspirate([well], vols=[200])
     assert self.lh.head[0].get_tip().tracker.get_used_volume() == 200
     with self.assertRaises(ChannelizedError):
       await self.lh.dispense([well], vols=[60])
-    # test volume doens't change on failed dispense
+    # test volume doesn't change on failed dispense
     assert self.lh.head[0].get_tip().tracker.get_used_volume() == 200
 
-  async def test_96_head_volume_tracking(self):
+  async def test_96_head_volume_tracking_multi_container(self):
     for item in self.plate.get_all_items():
-      item.tracker.set_liquids([(Liquid.WATER, 10)])
+      item.tracker.set_volume(10)
     await self.lh.pick_up_tips96(self.tip_rack)
     await self.lh.aspirate96(self.plate, volume=10)
     for i in range(96):
@@ -1103,60 +1030,21 @@ class TestLiquidHandlerVolumeTracking(unittest.IsolatedAsyncioTestCase):
     for i in range(96):
       self.assertEqual(self.lh.head96[i].get_tip().tracker.get_used_volume(), 0)
       self.plate.get_item(i).tracker.get_used_volume() == 10
+    await self.lh.return_tips96()
 
+  async def test_96_head_volume_tracking_single_container(self):
+    well = self.single_well_plate.get_item(0)
+    well.tracker.set_volume(10 * 96)
+    await self.lh.pick_up_tips96(self.tip_rack)
 
-class TestLiquidHandlerCrossContaminationTracking(unittest.IsolatedAsyncioTestCase):
-  async def asyncSetUp(self):
-    self.backend = backends.SaverBackend(num_channels=8)
-    self.deck = STARLetDeck()
-    self.lh = LiquidHandler(backend=self.backend, deck=self.deck)
-    self.tip_rack = STF(name="tip_rack")
-    self.plate = Cor_96_wellplate_360ul_Fb(name="plate")
-    self.deck.assign_child_resource(self.tip_rack, location=Coordinate(0, 0, 0))
-    self.deck.assign_child_resource(self.plate, location=Coordinate(100, 100, 0))
-    await self.lh.setup()
-    set_volume_tracking(enabled=True)
-    set_cross_contamination_tracking(enabled=True)
+    await self.lh.aspirate96(self.single_well_plate, volume=10)
+    assert all(self.lh.head96[i].get_tip().tracker.get_used_volume() == 10 for i in range(96))
+    assert all(self.lh.head96[i].get_tip().tracker.volume == 10 for i in range(96))
+    assert well.tracker.get_used_volume() == 0
 
-  async def asyncTearDown(self):
-    set_volume_tracking(enabled=False)
-    set_cross_contamination_tracking(enabled=False)
+    await self.lh.dispense96(self.single_well_plate, volume=10)
+    assert all(self.lh.head96[i].get_tip().tracker.get_used_volume() == 0 for i in range(96))
+    assert all(self.lh.head96[i].get_tip().tracker.volume == 0 for i in range(96))
+    assert well.tracker.get_used_volume() == 10 * 96
 
-  async def test_aspirate_with_contaminated_tip(self):
-    blood_well = self.plate.get_item("A1")
-    etoh_well = self.plate.get_item("A2")
-    dest_well = self.plate.get_item("A3")
-    await self.lh.pick_up_tips(self.tip_rack["A1"])
-    blood_well.tracker.set_liquids([(Liquid.BLOOD, 10)])
-    etoh_well.tracker.set_liquids([(Liquid.ETHANOL, 10)])
-    await self.lh.aspirate([blood_well], vols=[10])
-    await self.lh.dispense([dest_well], vols=[10])
-    with self.assertRaises(CrossContaminationError):
-      await self.lh.aspirate([etoh_well], vols=[10])
-
-  async def test_aspirate_from_same_well_twice(self):
-    src_well = self.plate.get_item("A1")
-    dst_well = self.plate.get_item("A2")
-    await self.lh.pick_up_tips(self.tip_rack["A1"])
-    src_well.tracker.set_liquids([(Liquid.BLOOD, 20)])
-    await self.lh.aspirate([src_well], vols=[10])
-    await self.lh.dispense([dst_well], vols=[10])
-    self.assertEqual(dst_well.tracker.liquids, [(Liquid.BLOOD, 10)])
-    await self.lh.aspirate([src_well], vols=[10])
-    await self.lh.dispense([dst_well], vols=[10])
-    self.assertEqual(dst_well.tracker.liquids, [(Liquid.BLOOD, 20)])
-
-  async def test_aspirate_from_well_with_partial_overlap(self):
-    pure_blood_well = self.plate.get_item("A1")
-    mix_well = self.plate.get_item("A2")
-    await self.lh.pick_up_tips(self.tip_rack["A1"])
-    pure_blood_well.tracker.set_liquids([(Liquid.BLOOD, 20)])
-    mix_well.tracker.set_liquids([(Liquid.ETHANOL, 20)])
-    await self.lh.aspirate([pure_blood_well], vols=[10])
-    await self.lh.dispense([mix_well], vols=[10])
-    self.assertEqual(
-      mix_well.tracker.liquids,
-      [(Liquid.ETHANOL, 20), (Liquid.BLOOD, 10)],
-    )  # order matters
-    with self.assertRaises(CrossContaminationError):
-      await self.lh.aspirate([pure_blood_well], vols=[10])
+    await self.lh.return_tips96()

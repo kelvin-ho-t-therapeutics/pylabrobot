@@ -28,7 +28,7 @@ def Cor_Axy_24_wellplate_10mL_Vb(name: str, with_lid: bool = False) -> Plate:
     size_y=85.48,
     size_z=44.24,
     lid=Cor_Axy_24_wellplate_10mL_Vb_Lid(name + "_lid") if with_lid else None,
-    model="Axy_24_DW_10ML",
+    model=Cor_Axy_24_wellplate_10mL_Vb.__name__,
     ordered_items=create_ordered_items_2d(
       Well,
       num_items_x=6,
@@ -61,8 +61,40 @@ def _compute_volume_from_height_Cor_Axy_24_wellplate_10mL_Vb(h: float):
   )
 
 
-#: Axy_24_DW_10ML
-def Axy_24_DW_10ML(name: str, with_lid: bool = False):
-  return NotImplementedError(
-    "Axy_24_DW_10ML definition is deprecated. Use " "Cor_Axy_24_wellplate_10mL_Vb instead."
+# # # # # # # # # # Cor_Axy_96_wellplate_500uL_Ub # # # # # # # # # #
+
+
+def Cor_Axy_96_wellplate_500uL_Ub(name: str, with_lid: bool = False) -> Plate:
+  """
+  Axygen 96w Shallow Well Plate 500uL U Bottom
+  - Product number: P-96-450V-C-S
+  - manufacturer_link: https://ecatalog.corning.com/life-sciences/b2c/US/en/Genomics-&-Molecular-Biology/Automation-Consumables/Deep-Well-Plate/Axygen%C2%AE-Deep-Well-and-Assay-Plates/p/P-96-450V-C-S
+  - Spec sheet info: https://www.corning.com/catalog/cls/documents/selection-guides/CLS-A-PSG-001.pdf
+  - working volume: 450uL
+  - brand: Axygen
+  - material: Polypropylene
+  - sterile: yes
+  """
+  return Plate(
+    name=name,
+    size_x=127.0,  # measured
+    size_y=85.51,  # measured
+    size_z=14.82,  # measured
+    model="Cor_Axy_96_wellplate_500uL_Ub",
+    ordered_items=create_ordered_items_2d(
+      Well,
+      num_items_x=12,  # from spec
+      num_items_y=8,  # from spec
+      dx=9.6,  # measured
+      dy=7.0,  # measured
+      dz=1.2,  # measured
+      item_dx=9.0,  # measured
+      item_dy=9.0,  # measured
+      size_x=8.0,  # measured
+      size_y=8.0,  # measured
+      size_z=14.82 - 2.57,  # measured
+      bottom_type=WellBottomType.U,
+      material_z_thickness=1.18,  # measured
+      cross_section_type=CrossSectionType.CIRCLE,
+    ),
   )
