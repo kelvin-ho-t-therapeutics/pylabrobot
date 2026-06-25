@@ -24,14 +24,13 @@ from typing import (
   cast,
 )
 
+from pylabrobot.liquid_handling.channel_positioning import (
+  compute_channel_offsets,
+)
 from pylabrobot.liquid_handling.errors import ChannelizedError
 from pylabrobot.liquid_handling.strictness import (
   Strictness,
   get_strictness,
-)
-from pylabrobot.liquid_handling.utils import (
-  get_tight_single_resource_liquid_op_offsets,
-  get_wide_single_resource_liquid_op_offsets,
 )
 from pylabrobot.machines.machine import Machine, need_setup_finished
 from pylabrobot.plate_reading import PlateReader
@@ -145,7 +144,16 @@ class LiquidHandler(Resource, Machine):
     self.location = Coordinate.zero()
     super().assign_child_resource(deck, location=deck.location or Coordinate.zero())
 
-    self._resource_pickup: Optional[ResourcePickup] = None
+    self._resource_pickups: Dict[int, Optional[ResourcePickup]] = {}
+
+  @property
+  def _resource_pickup(self) -> Optional[ResourcePickup]:
+    """Backward-compatible access to the first arm's pickup state."""
+    return self._resource_pickups.get(0)
+
+  @_resource_pickup.setter
+  def _resource_pickup(self, value: Optional[ResourcePickup]) -> None:
+    self._resource_pickups[0] = value
 
   async def setup(self, **backend_kwargs):
     """Prepare the robot for use."""
@@ -158,24 +166,69 @@ class LiquidHandler(Resource, Machine):
     await super().setup(**backend_kwargs)
 
     self.head = {c: TipTracker(thing=f"Channel {c}") for c in range(self.backend.num_channels)}
-    self.head96 = {c: TipTracker(thing=f"Channel {c}") for c in range(96)}
 
-    self._resource_pickup = None
+    self.head96 = (
+      {c: TipTracker(thing=f"Channel {c}") for c in range(96)}
+      if self.backend.head96_installed
+      else {}
+    )
+
+    self.backend.set_heads(head=self.head, head96=self.head96 or None)
+
+    for tracker in self.head.values():
+      tracker.register_callback(self._state_updated)
+    for tracker in self.head96.values():
+      tracker.register_callback(self._state_updated)
+
+    self._resource_pickups = {a: None for a in range(self.backend.num_arms)}
 
   def serialize_state(self) -> Dict[str, Any]:
     """Serialize the state of this liquid handler. Use :meth:`~Resource.serialize_all_states` to
     serialize the state of the liquid handler and all children (the deck)."""
 
     head_state = {channel: tracker.serialize() for channel, tracker in self.head.items()}
-    return {"head_state": head_state}
+    head96_state = (
+      {channel: tracker.serialize() for channel, tracker in self.head96.items()}
+      if self.head96
+      else None
+    )
+    arm_state: Optional[Dict[int, Any]]
+    if self._resource_pickups:
+      arm_state = {
+        arm_id: serialize(pickup) if pickup is not None else None
+        for arm_id, pickup in self._resource_pickups.items()
+      }
+    else:
+      arm_state = None
+    return {
+      **super().serialize_state(),
+      "head_state": head_state,
+      "head96_state": head96_state,
+      "arm_state": arm_state,
+    }
 
   def load_state(self, state: Dict[str, Any]):
     """Load the liquid handler state from a file. Use :meth:`~Resource.load_all_state` to load the
     state of the liquid handler and all children (the deck)."""
 
+    super().load_state(state)
     head_state = state["head_state"]
+    if head_state and self.head == {}:
+      # we haven't connected with a backend yet, so we don't know the number of channels.
+      # Let's assume that the state accurately describes the number of channels.
+      self.head = {c: TipTracker(thing=f"Channel {c}") for c in head_state}
     for channel, tracker_state in head_state.items():
       self.head[channel].load_state(tracker_state)
+
+    head96_state = state.get("head96_state", {})
+    if head96_state:
+      if self.head96 == {}:
+        self.head96 = {c: TipTracker(thing=f"Channel {c}") for c in head96_state}
+      for channel, tracker_state in head96_state.items():
+        self.head96[channel].load_state(tracker_state)
+
+    # arm_state is informational only (read via serialize_state); no load needed since
+    # _resource_pickup is set/cleared by pick_up_resource/drop_resource at runtime.
 
   def update_head_state(self, state: Dict[int, Optional[Tip]]):
     """Update the state of the liquid handler head.
@@ -306,6 +359,20 @@ class LiquidHandler(Resource, Machine):
 
     return extra
 
+  def _compute_spread_offsets(
+    self,
+    resource: Resource,
+    use_channels: List[int],
+    spread: str,
+  ) -> List[Coordinate]:
+    """Compute channel spread offsets for a single-resource multi-channel operation."""
+    return compute_channel_offsets(
+      resource=resource,
+      num_channels=len(use_channels),
+      spread=spread,
+      channel_spacings=self.backend.get_channel_spacings(use_channels),
+    )
+
   def _make_sure_channels_exist(self, channels: List[int]):
     """Checks that the channels exist."""
     invalid_channels = [c for c in channels if c not in self.head]
@@ -423,9 +490,9 @@ class LiquidHandler(Resource, Machine):
     # checks
     self._assert_resources_exist(tip_spots)
     self._make_sure_channels_exist(use_channels)
-    assert (
-      len(tip_spots) == len(offsets) == len(use_channels)
-    ), "Number of tips and offsets and use_channels must be equal."
+    assert len(tip_spots) == len(offsets) == len(use_channels), (
+      "Number of tips and offsets and use_channels must be equal."
+    )
 
     # create operations
     pickups = [
@@ -452,16 +519,23 @@ class LiquidHandler(Resource, Machine):
       del backend_kwargs[extra]
 
     # actually pick up the tips
-    error: Optional[Exception] = None
+    error: Optional[BaseException] = None
     try:
       await self.backend.pick_up_tips(ops=pickups, use_channels=use_channels, **backend_kwargs)
-    except Exception as e:
+    except BaseException as e:
       error = e
 
     # determine which channels were successful
     successes = [error is None] * len(pickups)
-    if error is not None and isinstance(error, ChannelizedError):
-      successes = [channel_idx not in error.errors for channel_idx in use_channels]
+    if error is not None:
+      try:
+        tip_presence = await self.backend.request_tip_presence()
+        successes = [tip_presence[ch] is True for ch in use_channels]
+      except Exception as tip_presence_error:
+        if not isinstance(tip_presence_error, NotImplementedError):
+          logger.warning("Failed to query tip presence after error: %s", tip_presence_error)
+        if isinstance(error, ChannelizedError):
+          successes = [channel_idx not in error.errors for channel_idx in use_channels]
 
     # commit or rollback the state trackers
     for channel, op, success in zip(use_channels, pickups, successes):
@@ -560,9 +634,9 @@ class LiquidHandler(Resource, Machine):
     # checks
     self._assert_resources_exist(tip_spots)
     self._make_sure_channels_exist(use_channels)
-    assert (
-      len(tip_spots) == len(offsets) == len(use_channels) == len(tips)
-    ), "Number of channels and offsets and use_channels and tips must be equal."
+    assert len(tip_spots) == len(offsets) == len(use_channels) == len(tips), (
+      "Number of channels and offsets and use_channels and tips must be equal."
+    )
 
     # create operations
     drops = [
@@ -591,16 +665,23 @@ class LiquidHandler(Resource, Machine):
       del backend_kwargs[extra]
 
     # actually drop the tips
-    error: Optional[Exception] = None
+    error: Optional[BaseException] = None
     try:
       await self.backend.drop_tips(ops=drops, use_channels=use_channels, **backend_kwargs)
-    except Exception as e:
+    except BaseException as e:
       error = e
 
     # determine which channels were successful
     successes = [error is None] * len(drops)
-    if error is not None and isinstance(error, ChannelizedError):
-      successes = [channel_idx not in error.errors for channel_idx in use_channels]
+    if error is not None:
+      try:
+        tip_presence = await self.backend.request_tip_presence()
+        successes = [tip_presence[ch] is False for ch in use_channels]
+      except Exception as tip_presence_error:
+        if not isinstance(tip_presence_error, NotImplementedError):
+          logger.warning("Failed to query tip presence after error: %s", tip_presence_error)
+        if isinstance(error, ChannelizedError):
+          successes = [channel_idx not in error.errors for channel_idx in use_channels]
 
     # commit or rollback the state trackers
     for channel, op, success in zip(use_channels, drops, successes):
@@ -712,10 +793,7 @@ class LiquidHandler(Resource, Machine):
       raise RuntimeError("No tips have been picked up and no channels were specified.")
 
     trash = self.deck.get_trash_area()
-    trash_offsets = get_tight_single_resource_liquid_op_offsets(
-      trash,
-      num_channels=n,
-    )
+    trash_offsets = compute_channel_offsets(trash, num_channels=n, spread="tight")
     # add trash_offsets to offsets if defined, otherwise use trash_offsets
     # too advanced for mypy
     offsets = [
@@ -891,18 +969,8 @@ class LiquidHandler(Resource, Machine):
     if len(set(resources)) == 1:
       resource = resources[0]
       resources = [resource] * len(use_channels)
-      if spread == "tight":
-        center_offsets = get_tight_single_resource_liquid_op_offsets(
-          resource=resource, num_channels=len(use_channels)
-        )
-      elif spread == "wide":
-        center_offsets = get_wide_single_resource_liquid_op_offsets(
-          resource=resource, num_channels=len(use_channels)
-        )
-      elif spread == "custom":
-        center_offsets = [Coordinate.zero()] * len(use_channels)
-      else:
-        raise ValueError("Invalid value for 'spread'. Must be 'tight', 'wide', or 'custom'.")
+
+      center_offsets = self._compute_spread_offsets(resource, use_channels, spread)
 
       # add user defined offsets to the computed centers
       offsets = [c + o for c, o in zip(center_offsets, offsets)]
@@ -1074,18 +1142,8 @@ class LiquidHandler(Resource, Machine):
     if len(set(resources)) == 1:
       resource = resources[0]
       resources = [resource] * len(use_channels)
-      if spread == "tight":
-        center_offsets = get_tight_single_resource_liquid_op_offsets(
-          resource=resource, num_channels=len(use_channels)
-        )
-      elif spread == "wide":
-        center_offsets = get_wide_single_resource_liquid_op_offsets(
-          resource=resource, num_channels=len(use_channels)
-        )
-      elif spread == "custom":
-        center_offsets = [Coordinate.zero()] * len(use_channels)
-      else:
-        raise ValueError("Invalid value for 'spread'. Must be 'tight', 'wide', or 'custom'.")
+
+      center_offsets = self._compute_spread_offsets(resource, use_channels, spread)
 
       # add user defined offsets to the computed centers
       offsets = [c + o for c, o in zip(center_offsets, offsets)]
@@ -1696,9 +1754,10 @@ class LiquidHandler(Resource, Machine):
         if tip is None:
           continue
 
-        if not container.tracker.is_disabled and does_volume_tracking():
-          container.tracker.remove_liquid(volume=volume)
-        tip.tracker.add_liquid(volume=volume)
+        if does_volume_tracking():
+          if not container.tracker.is_disabled:
+            container.tracker.remove_liquid(volume=volume)
+          tip.tracker.add_liquid(volume=volume)
 
       aspiration = MultiHeadAspirationContainer(
         container=container,
@@ -1724,9 +1783,10 @@ class LiquidHandler(Resource, Machine):
         if tip is None:
           continue
 
-        if not well.tracker.is_disabled and does_volume_tracking():
-          well.tracker.remove_liquid(volume=volume)
-        tip.tracker.add_liquid(volume=volume)
+        if does_volume_tracking():
+          if not well.tracker.is_disabled:
+            well.tracker.remove_liquid(volume=volume)
+          tip.tracker.add_liquid(volume=volume)
 
       aspiration = MultiHeadAspirationPlate(
         wells=cast(List[Well], containers),
@@ -1844,7 +1904,7 @@ class LiquidHandler(Resource, Machine):
 
       if does_volume_tracking():
         tip.tracker.remove_liquid(volume=volume)
-      elif tip.tracker.get_used_volume() < volume:
+      elif tip.tracker.get_used_volume() <= volume:
         tip.tracker.remove_liquid(volume=min(tip.tracker.get_used_volume(), volume))
 
     if len(containers) == 1:  # single container
@@ -1952,7 +2012,7 @@ class LiquidHandler(Resource, Machine):
     self,
     resource: Resource,
     offset: Coordinate = Coordinate.zero(),
-    pickup_distance_from_top: float = 0,
+    pickup_distance_from_top: Optional[float] = None,
     direction: GripDirection = GripDirection.FRONT,
     **backend_kwargs,
   ):
@@ -1963,6 +2023,21 @@ class LiquidHandler(Resource, Machine):
       pickup_distance_from_top=pickup_distance_from_top,
       direction=direction,
     )
+
+    if self.setup_finished and not self._resource_pickups:
+      raise RuntimeError("No robotic arm is installed on this liquid handler.")
+
+    if pickup_distance_from_top is None:
+      if resource.preferred_pickup_location is not None:
+        logger.debug(
+          f"Using preferred pickup location for resource {resource.name} as pickup_distance_from_top was not specified."
+        )
+        pickup_distance_from_top = resource.get_size_z() - resource.preferred_pickup_location.z
+      else:
+        logger.debug(
+          f"No preferred pickup location for resource {resource.name}. Using default pickup distance of 5mm."
+        )
+        pickup_distance_from_top = 5.0
 
     if self._resource_pickup is not None:
       raise RuntimeError(f"Resource {self._resource_pickup.resource.name} already picked up")
@@ -1988,6 +2063,8 @@ class LiquidHandler(Resource, Machine):
     except Exception as e:
       self._resource_pickup = None
       raise e
+
+    self._state_updated()
 
   async def move_picked_up_resource(
     self,
@@ -2043,6 +2120,9 @@ class LiquidHandler(Resource, Machine):
       raise RuntimeError("No resource picked up")
     resource = self._resource_pickup.resource
 
+    if isinstance(destination, Resource):
+      destination.check_can_drop_resource_here(resource)
+
     # compute rotation based on the pickup_direction and drop_direction
     if self._resource_pickup.direction == direction:
       rotation_applied_by_move = 0
@@ -2094,9 +2174,9 @@ class LiquidHandler(Resource, Machine):
 
     # get the location of the destination
     if isinstance(destination, ResourceStack):
-      assert (
-        destination.direction == "z"
-      ), "Only ResourceStacks with direction 'z' are currently supported"
+      assert destination.direction == "z", (
+        "Only ResourceStacks with direction 'z' are currently supported"
+      )
 
       # the resource can be rotated wrt the ResourceStack. This is allowed as long
       # as it's in multiples of 180 degrees. 90 degrees is not allowed.
@@ -2151,6 +2231,7 @@ class LiquidHandler(Resource, Machine):
     result = await self.backend.drop_resource(drop=drop, **backend_kwargs)
 
     self._resource_pickup = None
+    self._state_updated()
 
     # we rotate the resource on top of its original rotation. So in order to set the new rotation,
     # we have to subtract its current rotation.
@@ -2392,7 +2473,7 @@ class LiquidHandler(Resource, Machine):
       **backend_kwargs,
     )
 
-  def serialize(self):
+  def serialize(self) -> dict:
     return {
       **Resource.serialize(self),
       **Machine.serialize(self),
@@ -2763,7 +2844,7 @@ class LiquidHandler(Resource, Machine):
 
       # 6: Execute tip movement/consolidation
       for idx, target_tip_spots in enumerate(merged_target_tip_clusters):
-        print(f"   - tip transfer cycle: {idx+1} / {len_transfers}")
+        print(f"   - tip transfer cycle: {idx + 1} / {len_transfers}")
 
         origin_tip_spots = [all_origin_tip_spots.pop(0) for _ in range(len(target_tip_spots))]
 

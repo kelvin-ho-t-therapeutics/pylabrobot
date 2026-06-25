@@ -11,6 +11,10 @@ from .agilent import (
   SynergyH1Backend,
 )
 from .bmg_labtech import CLARIOstarBackend
+from .byonoy import (
+  ByonoyAbsorbance96AutomateBackend,
+  ByonoyLuminescence96AutomateBackend,
+)
 from .chatterbox import PlateReaderChatterboxBackend
 from .image_reader import ImageReader
 from .imager import Imager
@@ -26,6 +30,7 @@ from .molecular_devices import (
   MolecularDevicesNVRAMError,
   MolecularDevicesSettings,
   MolecularDevicesSpectraMax384PlusBackend,
+  MolecularDevicesSpectraMaxGeminiEMBackend,
   MolecularDevicesSpectraMaxM5Backend,
   MolecularDevicesUnrecognizedCommandError,
   PmtGain,
@@ -44,3 +49,5 @@ from .standard import (
   ImagingResult,
   Objective,
 )
+from .tecan import ExperimentalTecanInfinite200ProBackend
+from .tecan.spark20m.spark_backend import ExperimentalSparkBackend

@@ -13,6 +13,7 @@ from pylabrobot.resources.well import (
   Well,
   WellBottomType,
 )
+from pylabrobot.utils.interpolation import interpolate_1d
 
 # Please conform with the 'manufacturer-first, then brands' naming principle:
 
@@ -121,40 +122,39 @@ def Thermo_TS_96_wellplate_1200ul_Rb(name: str, with_lid: bool = False) -> Plate
 # # # # # # # # # # Thermo_AB_96_wellplate_300ul_Vb_EnduraPlate # # # # # # # # # #
 
 
+# Calibration data: measured height (mm) → known volume (uL)
+_enduraplate_height_to_volume = {
+  0.0: 0.0,
+  0.17: 4.0,
+  0.77: 8.0,
+  2.27: 20.0,
+  6.57: 70.0,
+  9.17: 120.0,
+  11.17: 170.0,
+  13.17: 220.0,
+  15.17: 260.0,
+}
+_enduraplate_volume_to_height = {v: k for k, v in _enduraplate_height_to_volume.items()}
+
+
 def _compute_volume_from_height_Thermo_AB_96_wellplate_300ul_Vb_EnduraPlate(
   h: float,
-):
-  if h > 21.1:
-    raise ValueError(f"Height {h} is too large for" + "ThermoScientific_96_wellplate_1200ul_Rd")
-  return max(
-    0.9617 + 10.2590 * h - 1.3069 * h**2 + 0.26799 * h**3 - 0.01003 * h**4,
-    0,
-  )
+) -> float:
+  if h > 20.1 * 1.05:
+    raise ValueError(f"Height {h} is too large for Thermo_AB_96_wellplate_300ul_Vb_EnduraPlate")
+  return round(interpolate_1d(h, _enduraplate_height_to_volume, bounds_handling="extrapolate"), 3)
 
 
 def _compute_height_from_volume_Thermo_AB_96_wellplate_300ul_Vb_EnduraPlate(
   liquid_volume: float,
-):
+) -> float:
   if liquid_volume > 315:  # 5% tolerance
     raise ValueError(
-      f"Volume {liquid_volume} is too large for" + "ThermoScientific_96_wellplate_1200ul_Rd"
+      f"Volume {liquid_volume} is too large for Thermo_AB_96_wellplate_300ul_Vb_EnduraPlate"
     )
-  return max(
-    -0.1823
-    + 0.1327 * liquid_volume
-    - 0.000637 * liquid_volume**2
-    + 1.6577e-6 * liquid_volume**3
-    - 1.1487e-9 * liquid_volume**4,
-    0,
+  return round(
+    interpolate_1d(liquid_volume, _enduraplate_volume_to_height, bounds_handling="extrapolate"), 3
   )
-
-
-# results_measurement_fitting_dict = {
-#     "Volume (ul)": [0, 4, 8, 20, 70, 120, 170, 220, 260],
-#     "Observed Height (mm)": [0, 0.17, 0.77, 2.27, 6.57, 9.17, 11.17, 13.17, 15.17],
-#     "Predicted Height (mm)": [0, 0.338, 0.839, 2.230, 6.526, 9.195, 11.152, 13.141, 15.145],
-#     "Relative Deviation (%)": [0, 99.07, 9.01, -1.76, -0.66, 0.27, -0.16, -0.22, -0.17]
-# }
 
 
 def Thermo_AB_96_wellplate_300ul_Vb_EnduraPlate_Lid(name: str) -> Lid:
@@ -249,8 +249,9 @@ def Thermo_Nunc_96_well_plate_1300uL_Rb(name: str) -> Plate:
       bottom_type=WellBottomType.U,
       material_z_thickness=31.6 - 29.1 - 1.4,  # from definition, F - L - N
       cross_section_type=CrossSectionType.CIRCLE,
-      compute_height_from_volume=lambda liquid_volume: liquid_volume
-      / (math.pi * ((well_diameter / 2) ** 2)),
+      compute_height_from_volume=lambda liquid_volume: (
+        liquid_volume / (math.pi * ((well_diameter / 2) ** 2))
+      ),
     ),
   )
 
@@ -258,44 +259,41 @@ def Thermo_Nunc_96_well_plate_1300uL_Rb(name: str) -> Plate:
 # # # # # # # # # # thermo_AB_96_wellplate_300ul_Vb_MicroAmp # # # # # # # # # #
 
 
+# Calibration data: measured height (mm) → known volume (uL)
+_microamp_height_to_volume = {
+  0.0: 0.0,
+  1.69: 4.0,
+  2.29: 8.0,
+  3.89: 20.0,
+  5.79: 40.0,
+  8.49: 70.0,
+  10.59: 120.0,
+  12.69: 170.0,
+  14.79: 220.0,
+  16.59: 260.0,
+  17.89: 290.0,
+}
+_microamp_volume_to_height = {v: k for k, v in _microamp_height_to_volume.items()}
+
+
 def _compute_volume_from_height_thermo_AB_96_wellplate_300ul_Vb_MicroAmp(height_mm: float) -> float:
   if height_mm > (23.24 - 0.74) * 1.05:
     raise ValueError(
-      f"Height {height_mm} is too large for " "thermo_AB_96_wellplate_300ul_Vb_MicroAmp"
+      f"Height {height_mm} is too large for thermo_AB_96_wellplate_300ul_Vb_MicroAmp"
     )
-  # Reverse fit: height → volume, 5th-degree polynomial via numeric inversion
-  return max(
-    -6.7862
-    + 2.7847 * height_mm
-    - 0.17352 * height_mm**2
-    + 0.006029 * height_mm**3
-    - 9.971e-5 * height_mm**4
-    + 6.451e-7 * height_mm**5,
-    0,
+  return round(
+    interpolate_1d(height_mm, _microamp_height_to_volume, bounds_handling="extrapolate"), 3
   )
 
 
 def _compute_height_from_volume_thermo_AB_96_wellplate_300ul_Vb_MicroAmp(volume_ul: float) -> float:
   if volume_ul > 305:  # 5% tolerance above 290 µL
     raise ValueError(
-      f"Volume {volume_ul} is too large for " "thermo_AB_96_wellplate_300ul_Vb_MicroAmp"
+      f"Volume {volume_ul} is too large for thermo_AB_96_wellplate_300ul_Vb_MicroAmp"
     )
-  # Polynomial coefficients: degree 5 fit from volume → height
-  return max(
-    1.0796
-    + 0.1570 * volume_ul
-    - 0.00099828 * volume_ul**2
-    + 3.4541e-6 * volume_ul**3
-    - 3.5805e-9 * volume_ul**4
-    - 1.8018e-12 * volume_ul**5,
-    0,
+  return round(
+    interpolate_1d(volume_ul, _microamp_volume_to_height, bounds_handling="extrapolate"), 3
   )
-
-
-# results_measurement_fitting_dict = {
-#  'Volume (ul)': [4, 8, 20, 40, 70, 120, 170, 220, 260, 290],
-#  'Observed Height (mm)': [1.69, 2.29, 3.89, 5.79, 8.49, 10.59, 12.69, 14.79, 16.59, 17.89]
-# }
 
 
 def thermo_AB_96_wellplate_300ul_Vb_MicroAmp_Lid(name: str) -> Lid:
@@ -467,4 +465,40 @@ def Thermo_TS_Nunc_96_wellplate_300uL_Fb_Lid(name: str) -> Lid:
     size_z=9.1,  # from spec
     nesting_z_height=16.7 - 14.86,  # from spec: lid+plate_z - plate_z
     model="Thermo_TS_Nunc_96_assay_300uL_Fb_Lid",
+  )
+
+
+# # # # # # # # # # thermo_TS_nalgene_1_troughplate_300mL_Fb # # # # # # # # # #
+
+
+def thermo_TS_nalgene_1_troughplate_300mL_Fb(name: str) -> Plate:
+  """Thermo Fisher Scientific Nalgene 300mL Flat Bottom Reservoir
+  - Product Number: 12001300 (non-sterile), 12001301 (sterile)
+  - 1-well reservoir with SBS footprint
+  - Max Volume: 300 mL
+  - manufacturer_link: https://www.fishersci.com/shop/products/nalgene-disposable-polypropylene-robotic-reservoirs/12565572
+  - Spec sheet info: https://assets.fishersci.com/TFS-Assets/LCD/Schematics-&-Diagrams/120013XX_0405.PDF
+  """
+  return Plate(
+    name=name,
+    size_x=127.8,  # from spec
+    size_y=85.5,  # from spec
+    size_z=39.9,  # from spec
+    model=thermo_TS_nalgene_1_troughplate_300mL_Fb.__name__,
+    ordered_items=create_ordered_items_2d(
+      Well,
+      num_items_x=1,  # from spec
+      num_items_y=1,  # from spec
+      dx=(127.8 - 123.8) / 2,  # from spec
+      dy=(85.5 - 82.1) / 2,  # from spec
+      dz=3.3,  # from spec
+      item_dx=0,  # from spec
+      item_dy=0,  # from spec
+      size_x=123.8,  # from spec
+      size_y=82.1,  # from spec
+      size_z=39.9 - 3.3 - 1.15,  # from spec/calculated
+      bottom_type=WellBottomType.FLAT,  # from spec
+      cross_section_type=CrossSectionType.RECTANGLE,  # rectangle wells
+      material_z_thickness=1.15,  # measured.
+    ),
   )

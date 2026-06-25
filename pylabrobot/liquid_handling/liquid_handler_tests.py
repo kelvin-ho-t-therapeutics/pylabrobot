@@ -9,12 +9,14 @@ import pytest
 
 from pylabrobot.liquid_handling.backends.backend import LiquidHandlerBackend
 from pylabrobot.liquid_handling.backends.chatterbox import LiquidHandlerChatterboxBackend
+from pylabrobot.liquid_handling.channel_positioning import (
+  get_tight_single_resource_liquid_op_offsets,
+)
 from pylabrobot.liquid_handling.errors import ChannelizedError
 from pylabrobot.liquid_handling.strictness import (
   Strictness,
   set_strictness,
 )
-from pylabrobot.liquid_handling.utils import get_tight_single_resource_liquid_op_offsets
 from pylabrobot.resources import (
   PLT_CAR_L5AC_A00,
   TIP_CAR_480_A00,
@@ -44,6 +46,7 @@ from pylabrobot.resources.hamilton import (
 from pylabrobot.resources.revvity.plates import Revvity_384_wellplate_28ul_Ub
 from pylabrobot.resources.utils import create_ordered_items_2d
 from pylabrobot.resources.volume_tracker import (
+  no_volume_tracking,
   set_volume_tracking,
 )
 from pylabrobot.resources.well import Well
@@ -57,6 +60,7 @@ from .standard import (
   MultiHeadAspirationPlate,
   MultiHeadDispensePlate,
   Pickup,
+  ResourcePickup,
   SingleChannelAspiration,
   SingleChannelDispense,
 )
@@ -66,7 +70,10 @@ def _create_mock_backend(num_channels: int = 8):
   """Create a mock LiquidHandlerBackend with the specified number of channels."""
   mock = unittest.mock.create_autospec(LiquidHandlerBackend, instance=True)
   type(mock).num_channels = PropertyMock(return_value=num_channels)
+  type(mock).num_arms = PropertyMock(return_value=1)
+  type(mock).head96_installed = PropertyMock(return_value=True)
   mock.can_pick_up_tip.return_value = True
+  mock.get_channel_spacings.side_effect = lambda channels: [9.0] * len(channels)
   return mock
 
 
@@ -526,6 +533,15 @@ class TestLiquidHandlerCommands(unittest.IsolatedAsyncioTestCase):
     self.backend.drop_tips96.assert_called_once()
     call_kwargs = self.backend.drop_tips96.call_args.kwargs
     self.assertEqual(call_kwargs["drop"].offset, Coordinate(1, 3, 3))
+
+  async def test_aspirate96_tip_tracker_respects_volume_tracking_off(self):
+    """With volume tracking off, aspirate96 leaves the 96-head tip trackers untouched, matching
+    single-channel aspirate (the global flag governs the tip side, not just the source)."""
+    await self.lh.pick_up_tips96(self.tip_rack)
+    tip = self.lh.head96[0].get_tip()
+    with no_volume_tracking():
+      await self.lh.aspirate96(self.plate, volume=10)
+    self.assertEqual(tip.tracker.get_used_volume(), 0)
 
   async def test_default_offset_head96_initializer(self):
     backend = _create_mock_backend(num_channels=8)
@@ -1108,3 +1124,217 @@ class TestLiquidHandlerVolumeTracking(unittest.IsolatedAsyncioTestCase):
     assert all(self.lh.head96[i].get_tip().tracker.get_used_volume() == 0 for i in range(96))
     assert all(w.tracker.get_used_volume() == 10 for w in quadrant_wells)
     await self.lh.return_tips96()
+
+
+class TestLiquidHandlerSerializeState(unittest.IsolatedAsyncioTestCase):
+  """Tests for LiquidHandler.serialize_state() and load_state()."""
+
+  async def asyncSetUp(self):
+    self.backend = _create_mock_backend(num_channels=8)
+    self.deck = STARLetDeck()
+    self.lh = LiquidHandler(backend=self.backend, deck=self.deck)
+    self.tip_rack = hamilton_96_tiprack_300uL_filter(name="tip_rack")
+    self.plate = Cor_96_wellplate_360ul_Fb(name="plate")
+    self.deck.assign_child_resource(self.tip_rack, location=Coordinate(0, 0, 0))
+    self.deck.assign_child_resource(self.plate, location=Coordinate(100, 100, 0))
+    await self.lh.setup()
+
+  async def test_serialize_state_after_setup(self):
+    state = self.lh.serialize_state()
+    self.assertIn("head_state", state)
+    self.assertIn("head96_state", state)
+    self.assertIn("arm_state", state)
+
+    # 8 channels, all without tips
+    self.assertEqual(len(state["head_state"]), 8)
+    for channel_state in state["head_state"].values():
+      self.assertIsNone(channel_state["tip"])
+
+    # 96 channels for head96
+    self.assertEqual(len(state["head96_state"]), 96)
+
+    # 1 arm, no resource picked up
+    self.assertEqual(state["arm_state"], {0: None})
+
+  async def test_serialize_state_no_head96(self):
+    backend = _create_mock_backend(num_channels=8)
+    type(backend).head96_installed = PropertyMock(return_value=False)
+    deck = STARLetDeck()
+    lh = LiquidHandler(backend=backend, deck=deck)
+    await lh.setup()
+
+    state = lh.serialize_state()
+    self.assertIsNone(state["head96_state"])
+
+  async def test_serialize_state_no_arms(self):
+    backend = _create_mock_backend(num_channels=8)
+    type(backend).num_arms = PropertyMock(return_value=0)
+    deck = STARLetDeck()
+    lh = LiquidHandler(backend=backend, deck=deck)
+    await lh.setup()
+
+    state = lh.serialize_state()
+    self.assertIsNone(state["arm_state"])
+
+  async def test_serialize_state_with_resource_pickup(self):
+    resource = self.plate
+    pickup = ResourcePickup(
+      resource=resource,
+      offset=Coordinate.zero(),
+      pickup_distance_from_top=5.0,
+      direction=GripDirection.FRONT,
+    )
+    self.lh._resource_pickup = pickup
+
+    state = self.lh.serialize_state()
+    arm_state = state["arm_state"]
+    self.assertIsNotNone(arm_state[0])
+
+    serialized_pickup = arm_state[0]
+    self.assertEqual(serialized_pickup["type"], "ResourcePickup")
+    self.assertEqual(serialized_pickup["pickup_distance_from_top"], 5.0)
+    self.assertEqual(serialized_pickup["direction"], "FRONT")
+    self.assertIn("resource", serialized_pickup)
+    self.assertEqual(serialized_pickup["resource"]["name"], "plate")
+
+  async def test_serialize_state_arm_none_after_drop(self):
+    self.lh._resource_pickup = ResourcePickup(
+      resource=self.plate,
+      offset=Coordinate.zero(),
+      pickup_distance_from_top=5.0,
+      direction=GripDirection.LEFT,
+    )
+    self.assertIsNotNone(self.lh.serialize_state()["arm_state"][0])
+
+    self.lh._resource_pickup = None
+    self.assertEqual(self.lh.serialize_state()["arm_state"], {0: None})
+
+  async def test_load_state_head(self):
+    state = self.lh.serialize_state()
+    # Modify a tracker, load old state, verify it's restored
+    self.lh.head[0]._tip = hamilton_96_tiprack_300uL_filter(name="tmp").get_item("A1").get_tip()
+    self.lh.load_state(state)
+    self.assertIsNone(self.lh.head[0]._tip)
+
+  async def test_load_state_backward_compatible(self):
+    # Old state format without head96_state or arm_state
+    old_state = {"head_state": {c: self.lh.head[c].serialize() for c in self.lh.head}}
+    self.lh.load_state(old_state)  # should not raise
+
+
+class TestNoGoZoneIntegration(unittest.IsolatedAsyncioTestCase):
+  """Integration tests for no-go zone channel distribution through LiquidHandler."""
+
+  async def asyncSetUp(self):
+    self.backend = _create_mock_backend(num_channels=8)
+    self.backend.get_channel_spacings.side_effect = lambda channels: [9.0] * len(channels)
+    self.deck = STARLetDeck()
+    self.lh = LiquidHandler(backend=self.backend, deck=self.deck)
+
+    # A trough-like container with a center divider
+    from pylabrobot.resources.trough import Trough
+
+    self.trough = Trough(
+      name="trough",
+      size_x=19.0,
+      size_y=90.0,
+      size_z=65.0,
+      max_volume=60_000,
+      no_go_zones=[(Coordinate(0, 44, 0), Coordinate(19, 46, 65))],
+    )
+    self.deck.assign_child_resource(self.trough, location=Coordinate(100, 100, 0))
+
+    self.tip_rack = hamilton_96_tiprack_300uL_filter(name="tip_rack")
+    self.deck.assign_child_resource(self.tip_rack, location=Coordinate(0, 0, 0))
+    await self.lh.setup()
+
+  async def test_aspirate_2_channels_avoids_no_go_zone(self):
+    """2 channels on a trough with a center divider should be placed in separate compartments."""
+    t0 = self.tip_rack.get_item("A1").get_tip()
+    t1 = self.tip_rack.get_item("B1").get_tip()
+    self.lh.update_head_state({0: t0, 1: t1})
+    self.trough.tracker.set_volume(50_000)
+
+    await self.lh.aspirate([self.trough] * 2, vols=[100, 100], use_channels=[0, 1])
+
+    ops = self.backend.aspirate.call_args.kwargs["ops"]
+    y_offsets = [op.offset.y for op in ops]
+    # Both offsets should be non-zero (not centered) and in opposite compartments
+    self.assertEqual(len(y_offsets), 2)
+    # One positive (back compartment), one negative (front compartment)
+    self.assertTrue(y_offsets[0] > 0 and y_offsets[1] < 0, f"offsets: {y_offsets}")
+    # Neither should be near the divider (Y=44-46, container center=45, so offset ~0 is bad)
+    for y in y_offsets:
+      self.assertGreater(abs(y), 5, f"offset {y} too close to divider")
+
+  async def test_single_channel_respects_no_go_zone(self):
+    """Single channel on a container with no-go zones should be placed in a safe compartment."""
+    t = self.tip_rack.get_item("A1").get_tip()
+    self.lh.update_head_state({0: t})
+    self.trough.tracker.set_volume(50_000)
+
+    await self.lh.aspirate([self.trough], vols=[100], use_channels=[0])
+
+    ops = self.backend.aspirate.call_args.kwargs["ops"]
+    # Single channel should be placed in a compartment, not at container center
+    # (container center Y=45 is inside the no-go zone at Y=44-46)
+    self.assertNotAlmostEqual(ops[0].offset.y, 0.0)
+    # Should be in the back compartment center: (48+88)/2 = 68, offset = 68-45 = 23
+    self.assertAlmostEqual(ops[0].offset.y, 23.0)
+
+  async def test_dispense_uses_no_go_zones(self):
+    """Dispense should also use no-go zone logic."""
+    t0 = self.tip_rack.get_item("A1").get_tip()
+    t1 = self.tip_rack.get_item("B1").get_tip()
+    self.lh.update_head_state({0: t0, 1: t1})
+    t0.tracker.add_liquid(volume=100)
+    t1.tracker.add_liquid(volume=100)
+
+    await self.lh.dispense([self.trough] * 2, vols=[100, 100], use_channels=[0, 1])
+
+    ops = self.backend.dispense.call_args.kwargs["ops"]
+    y_offsets = [op.offset.y for op in ops]
+    self.assertTrue(y_offsets[0] > 0 and y_offsets[1] < 0, f"offsets: {y_offsets}")
+
+  async def test_no_go_zones_skipped_for_custom_spread(self):
+    """spread='custom' should bypass no-go zone logic."""
+    t0 = self.tip_rack.get_item("A1").get_tip()
+    t1 = self.tip_rack.get_item("B1").get_tip()
+    self.lh.update_head_state({0: t0, 1: t1})
+    self.trough.tracker.set_volume(50_000)
+
+    await self.lh.aspirate([self.trough] * 2, vols=[100, 100], use_channels=[0, 1], spread="custom")
+
+    ops = self.backend.aspirate.call_args.kwargs["ops"]
+    # Custom spread: offsets should be zero (user controls positioning)
+    for op in ops:
+      self.assertAlmostEqual(op.offset.y, 0.0)
+
+  async def test_no_go_zones_tight_vs_wide(self):
+    """spread='tight' should pack channels closer than spread='wide' within compartments."""
+    tips = [self.tip_rack.get_item(f"{chr(65 + i)}1").get_tip() for i in range(4)]
+    self.lh.update_head_state({i: t for i, t in enumerate(tips)})
+    self.trough.tracker.set_volume(50_000)
+    self.backend.get_channel_spacings.side_effect = lambda channels: [9.0] * len(channels)
+
+    # wide (default): channels spread far apart within each compartment
+    await self.lh.aspirate(
+      [self.trough] * 4, vols=[100] * 4, use_channels=[0, 1, 2, 3], spread="wide"
+    )
+    wide_ops = self.backend.aspirate.call_args.kwargs["ops"]
+    wide_offsets = sorted([op.offset.y for op in wide_ops])
+
+    self.lh.update_head_state({i: t for i, t in enumerate(tips)})
+    self.trough.tracker.set_volume(50_000)
+
+    # tight: channels packed at minimum spacing within each compartment
+    await self.lh.aspirate(
+      [self.trough] * 4, vols=[100] * 4, use_channels=[0, 1, 2, 3], spread="tight"
+    )
+    tight_ops = self.backend.aspirate.call_args.kwargs["ops"]
+    tight_offsets = sorted([op.offset.y for op in tight_ops])
+
+    # within each compartment, wide channels should be further apart than tight
+    wide_gap_lower = abs(wide_offsets[1] - wide_offsets[0])
+    tight_gap_lower = abs(tight_offsets[1] - tight_offsets[0])
+    self.assertGreater(wide_gap_lower, tight_gap_lower)

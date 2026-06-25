@@ -73,7 +73,7 @@ class TipSpot(Resource):
       tip = self._make_tip_func(self._get_next_tip_name())
     else:
       warnings.warn(
-        "The make_tip function should accept a 'name' parameter to " "assign unique names to tips.",
+        "The make_tip function should accept a 'name' parameter to assign unique names to tips.",
         DeprecationWarning,
       )
       tip = self._make_tip_func()  # type: ignore # ignore type check for deprecated behavior
@@ -128,10 +128,12 @@ class TipSpot(Resource):
     )
 
   def serialize_state(self) -> Dict[str, Any]:
-    return self.tracker.serialize()
+    return {**super().serialize_state(), **self.tracker.serialize()}
 
   def load_state(self, state: Dict[str, Any]):
-    self.tracker.load_state(state)
+    super().load_state(state)
+    tracker_state = {k: v for k, v in state.items() if k != "rotation"}
+    self.tracker.load_state(tracker_state)
 
   def get_identifier(self) -> str:
     """Get the (canonical) identifier, like `"A1"` of the tip spot in the parent tip rack. If the
