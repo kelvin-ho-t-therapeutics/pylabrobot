@@ -1089,7 +1089,17 @@ class Resource {
   }
 
   tooltipLabel() {
-    return `${this.name} (${this.constructor.name})`;
+      let text = `${this.name} (${this.constructor.name})`;
+    
+      if (this.liquidLabel) {
+        text += `\nLiquid: ${this.liquidLabel}`;
+      }
+    
+      if (this.volume !== undefined) {
+        text += `\nVolume: ${this.volume} µL`;
+      }
+    
+      return text;
   }
 
   getAbsoluteLocation() {
@@ -1478,28 +1488,34 @@ class Container extends Resource {
     const { max_volume, material_z_thickness } = resourceData;
     this.maxVolume = max_volume;
     this.volume = resourceData.volume || 0;
+    this.liquid = resourceData.liquid || null;
     this.material_z_thickness = material_z_thickness;
     this.has_height_volume_data = resourceData.height_volume_data != null;
   }
 
   static _liquidRGB = null;
 
-  static _getLiquidRGB() {
-    if (Container._liquidRGB === null) {
-      var hex = (document.getElementById("liquid_color") || {}).value || "F39C12";
-      hex = hex.replace(/^#/, "");
-      if (!/^[0-9a-fA-F]{6}$/.test(hex)) { hex = "F39C12"; }
-      Container._liquidRGB = [
-        parseInt(hex.substring(0, 2), 16),
-        parseInt(hex.substring(2, 4), 16),
-        parseInt(hex.substring(4, 6), 16),
+
+    static _getLiquidRGB(liquidName) {
+      const map = {
+        OPTIMPLEX: "#E74C3C",
+        DNA: "#3498DB",
+        DILUTEDTRANSFECTIONREAGENT: "#1ABC9C",
+        CELLCULTURE: "#9B59B6",
+        PBS_BUFFER: "#2ECC71",
+      };
+    
+      const hex = map[liquidName] || "#F39C12";
+    
+      return [
+        parseInt(hex.slice(1, 3), 16),
+        parseInt(hex.slice(3, 5), 16),
+        parseInt(hex.slice(5, 7), 16),
       ];
     }
-    return Container._liquidRGB;
-  }
 
-  static colorForVolume(volume, maxVolume) {
-    var rgb = Container._getLiquidRGB();
+  static colorForVolume(volume, maxVolume, liquidName) {
+    const rgb = Container._getLiquidRGB(liquidName);
     return `rgba(${rgb[0]}, ${rgb[1]}, ${rgb[2]}, ${volume / maxVolume})`;
   }
 
@@ -1514,6 +1530,8 @@ class Container extends Resource {
 
   setState(state) {
     super.setState(state);
+    this.liquid = state.liquid;
+    this.liquidLabel = state.liquid_label;
     this.setVolume(state.volume);
   }
 
@@ -1564,7 +1582,7 @@ class Well extends Container {
       }));
       mainShape.add(new Konva.Circle({ // liquid
         radius: this.size_x / 2,
-        fill: Well.colorForVolume(this.getVolume(), this.maxVolume),
+        fill: Well.colorForVolume(this.getVolume(), this.maxVolume, this.liquid),
         stroke: "black",
         strokeWidth: 1,
         offsetX: -this.size_x / 2,
@@ -1579,7 +1597,7 @@ class Well extends Container {
       mainShape.add(new Konva.Rect({ // liquid
         width: this.size_x,
         height: this.size_y,
-        fill: Well.colorForVolume(this.getVolume(), this.maxVolume),
+        fill: Well.colorForVolume(this.getVolume(), this.maxVolume, this.liquid),
         stroke: "black",
         strokeWidth: 1,
       }));
@@ -1601,7 +1619,7 @@ class Trough extends Container {
     group.add(new Konva.Rect({  // liquid layer
       width: this.size_x,
       height: this.size_y,
-      fill: Trough.colorForVolume(this.getVolume(), this.maxVolume),
+      fill: Trough.colorForVolume(this.getVolume(), this.maxVolume, this.liquid),
     }));
     return group;
   }
@@ -1716,7 +1734,7 @@ class Tube extends Container {
     }));
     mainShape.add(new Konva.Circle({  // liquid
       radius: this.size_x / 2,
-      fill: Tube.colorForVolume(this.getVolume(), this.maxVolume),
+      fill: Tube.colorForVolume(this.getVolume(), this.maxVolume, this.liquid),
       stroke: "black",
       strokeWidth: 1,
       offsetX: -this.size_x / 2,

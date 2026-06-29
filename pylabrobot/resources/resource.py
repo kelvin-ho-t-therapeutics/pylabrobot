@@ -846,7 +846,24 @@ class Resource(SerializableMixin):
     standard state channel. Subclasses overriding this method should merge
     in ``super().serialize_state()``.
     """
-    return {"rotation": self.rotation.serialize()}
+    state = {
+        "rotation": self.rotation.serialize()
+    }
+
+    liquid = getattr(self, "liquid", None)
+    state["liquid"] = liquid.name if hasattr(liquid, "name") else None
+    state["liquid_label"] = liquid.value if hasattr(liquid, "value") else None
+
+    tracker = getattr(self, "tracker", None)
+
+    if tracker is not None:
+        if hasattr(tracker, "get_used_volume"):
+            state["volume"] = tracker.get_used_volume()
+        elif hasattr(tracker, "volume"):
+            state["volume"] = tracker.volume
+
+    return state
+    #return {"rotation": self.rotation.serialize()}
 
   # Developer note: you probably don't need to override this method. Instead, override
   # `serialize_state`.
